@@ -625,6 +625,13 @@ var robotgoKeyAliases = map[string]string{
 	"stop":       "audio_stop",
 	"next":       "audio_next",
 	"previous":   "audio_prev",
+	// robotgo only recognizes cmd/alt/ctrl/shift as modifier names and silently
+	// ignores anything else, so the alias spellings clients send are mapped here.
+	"win":     "cmd",
+	"meta":    "cmd",
+	"command": "cmd",
+	"option":  "alt",
+	"control": "ctrl",
 }
 
 // NX_KEYTYPE_* values from IOKit/hidsystem/ev_keymap.h
@@ -655,6 +662,14 @@ func normalizeRobotgoKey(key string) string {
 		return alias
 	}
 	return key
+}
+
+func normalizeRobotgoKeys(keys []string) []string {
+	normalized := make([]string, len(keys))
+	for i, key := range keys {
+		normalized[i] = normalizeRobotgoKey(key)
+	}
+	return normalized
 }
 
 func appleScriptString(s string) string {
@@ -761,7 +776,7 @@ func tapKey(key string, modifiers ...string) {
 		log.Printf("Unsupported macOS key for AppleScript fallback: %q", key)
 		return
 	}
-	robotgo.KeyTap(normalizeRobotgoKey(key), toInterfaceSlice(modifiers)...)
+	robotgo.KeyTap(normalizeRobotgoKey(key), toInterfaceSlice(normalizeRobotgoKeys(modifiers))...)
 }
 
 // toggleKey sends key down/up. On macOS this uses System Events (osascript).
