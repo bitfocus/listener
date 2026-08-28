@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -50,6 +49,13 @@ import (
 //
 //go:embed icon.png
 var iconPNG []byte
+
+// trayIconPNG is the monochrome menu-bar/tray glyph. It is a macOS template
+// image (shape carried entirely in the alpha channel) so the system can tint
+// it for light/dark menu bars.
+//
+//go:embed tray_icon.png
+var trayIconPNG []byte
 
 // -------------------------
 // Configuration Handling
@@ -112,11 +118,12 @@ func init() {
 }
 
 func loadConfig() error {
-	home, err := os.UserHomeDir()
+	path, err := appConfigPath()
 	if err != nil {
 		return err
 	}
-	configPath = filepath.Join(home, ".bitfocus_listener.config")
+	configPath = path
+	migrateLegacyFile(legacyHomePath(".bitfocus_listener.config"), configPath)
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		config = Config{
 			Password:  generatePassword(),
@@ -236,6 +243,7 @@ func (e AuditEntry) String() string {
 type AuditLogger struct {
 	mu       sync.Mutex
 	entries  []AuditEntry
+	seq      uint64
 	file     *os.File
 	filePath string
 	fileSize int64
@@ -244,11 +252,12 @@ type AuditLogger struct {
 var audit *AuditLogger
 
 func initAuditLogger() error {
-	home, err := os.UserHomeDir()
+	logPath, err := appLogPath()
 	if err != nil {
 		return err
 	}
-	logPath := filepath.Join(home, ".bitfocus_listener.log")
+	migrateLegacyFile(legacyHomePath(".bitfocus_listener.log"), logPath)
+	migrateLegacyFile(legacyHomePath(".bitfocus_listener.log.1"), logPath+".1")
 
 	a := &AuditLogger{
 		entries:  make([]AuditEntry, 0, auditRingSize),
@@ -281,7 +290,7 @@ func (a *AuditLogger) rotateIfNeeded() {
 		log.Printf("Failed to rotate audit log (rename): %v", err)
 		return
 	}
-	// a.filePath is a fixed, application-controlled path (~/.bitfocus_listener.log),
+	// a.filePath is a fixed, application-controlled path (see appLogPath),
 	// never user input, so reopening it cannot be abused for file inclusion.
 	// nosec
 	f, err := os.OpenFile(a.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -312,6 +321,7 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 		a.entries = a.entries[1:]
 	}
 	a.entries = append(a.entries, entry)
+	a.seq++
 
 	// Write to file
 	if a.file == nil {
@@ -327,13 +337,16 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 	}
 }
 
-// Entries returns a copy of the ring buffer contents.
-func (a *AuditLogger) Entries() []AuditEntry {
+// Snapshot returns a copy of the ring buffer contents along with the total
+// number of entries ever logged. Once the ring is full its length stops
+// changing, so the counter is the only reliable way for viewers to tell that
+// the contents moved on.
+func (a *AuditLogger) Snapshot() ([]AuditEntry, uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	result := make([]AuditEntry, len(a.entries))
 	copy(result, a.entries)
-	return result
+	return result, a.seq
 }
 
 // auditLog is the convenience function used throughout the codebase.
@@ -1517,6 +1530,16 @@ func flashButtonText(btn *widget.Button, temp, original string) {
 	})
 }
 
+func flashLabelText(lbl *widget.Label, temp, original string) {
+	if lbl == nil {
+		return
+	}
+	lbl.SetText(temp)
+	time.AfterFunc(1500*time.Millisecond, func() {
+		lbl.SetText(original)
+	})
+}
+
 func openAccessibilitySettings() {
 	if runtime.GOOS != "darwin" {
 		return
@@ -2093,31 +2116,63 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 }
 
 func showActivityLogDialog(parent fyne.Window) {
-	logEntry := widget.NewMultiLineEntry()
-	logEntry.TextStyle = fyne.TextStyle{Monospace: true}
-	logEntry.Wrapping = fyne.TextWrapOff
-	var logContent string
-	// Keep selectable/copyable; reject edits so the viewer stays read-only.
-	logEntry.OnChanged = func(s string) {
-		if s == logContent {
-			return
+	type logRow struct{ stamp, message, full string }
+	var lines []logRow
+	logList := widget.NewList(
+		func() int { return len(lines) },
+		func() fyne.CanvasObject {
+			stamp := widget.NewRichText(&widget.TextSegment{
+				Style: widget.RichTextStyle{
+					SizeName:  theme.SizeNameCaptionText,
+					TextStyle: fyne.TextStyle{Monospace: true},
+					Inline:    true,
+				},
+			})
+			msg := widget.NewLabel("")
+			msg.TextStyle = fyne.TextStyle{Monospace: true}
+			msg.Truncation = fyne.TextTruncateEllipsis
+			return container.NewBorder(nil, nil, stamp, nil, msg)
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			objs := o.(*fyne.Container).Objects
+			msg := objs[0].(*widget.Label)
+			stamp := objs[1].(*widget.RichText)
+			stamp.Segments[0].(*widget.TextSegment).Text = lines[i].stamp
+			stamp.Refresh()
+			msg.SetText(lines[i].message)
+		},
+	)
+	var copyHint *widget.Label
+	// Selecting a row copies the full line. Unselect immediately so the same
+	// row can be copied again and no stale highlight survives a refresh.
+	logList.OnSelected = func(i widget.ListItemID) {
+		if i < len(lines) {
+			parent.Clipboard().SetContent(lines[i].full)
+			flashLabelText(copyHint, "Copied line to clipboard", "Click a line to copy it.")
 		}
-		logEntry.SetText(logContent)
+		logList.UnselectAll()
 	}
 
+	lastSeq := ^uint64(0)
 	refreshLog := func() {
-		entries := audit.Entries()
-		var sb strings.Builder
-		for _, e := range entries {
-			sb.WriteString(e.String())
-			sb.WriteByte('\n')
-		}
-		next := sb.String()
-		if next == logContent {
+		entries, seq := audit.Snapshot()
+		if seq == lastSeq {
 			return
 		}
-		logContent = next
-		logEntry.SetText(logContent)
+		lastSeq = seq
+		next := make([]logRow, 0, len(entries))
+		for _, e := range entries {
+			next = append(next, logRow{
+				stamp:   e.Time.Format("2006-01-02 15:04:05"),
+				message: fmt.Sprintf("[%s] %s %s", e.IP, e.Action, e.Detail),
+				full:    e.String(),
+			})
+		}
+		lines = next
+		logList.Refresh()
+		if len(lines) > 0 {
+			logList.ScrollToBottom()
+		}
 	}
 	refreshLog()
 
@@ -2158,12 +2213,16 @@ func showActivityLogDialog(parent fyne.Window) {
 		flashButtonText(copyPathBtn, "Copied", "Copy Path")
 	})
 
+	copyHint = widget.NewLabel("Click a line to copy it.")
+	copyHint.TextStyle = fyne.TextStyle{Italic: true}
+
 	bottomBar := container.NewVBox(
+		copyHint,
 		container.NewBorder(nil, nil, fileLabel, copyPathBtn),
 		container.NewHBox(layout.NewSpacer(), closeBtn, layout.NewSpacer()),
 	)
 
-	content := container.NewBorder(nil, container.NewPadded(bottomBar), nil, nil, logEntry)
+	content := container.NewBorder(nil, container.NewPadded(bottomBar), nil, nil, logList)
 
 	logDialog = dialog.NewCustomWithoutButtons("Activity Log", content, parent)
 	logDialog.SetOnClosed(func() {
@@ -2235,7 +2294,7 @@ func startGUI() {
 	if desk, ok := myApp.(desktop.App); ok {
 		trayEnabled = true
 		deskApp = desk
-		desk.SetSystemTrayIcon(appIcon)
+		desk.SetSystemTrayIcon(trayIconResource(appIcon))
 		trayHint.Text = "Runs in the menu bar when this window is closed."
 	} else {
 		trayHint.Text = "Quit from the window close button when tray is unavailable."
