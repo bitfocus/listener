@@ -35,7 +35,7 @@ There are no tests in this project.
 
 **Core application** — primarily `main.go`, with platform files for Dock policy, Windows console hiding, and Darwin mouse:
 
-1. **Configuration**: `Config` struct, load/save from `~/.bitfocus_listener.config` (JSON)
+1. **Configuration**: `Config` struct, load/save from the OS config dir (JSON). Config and audit-log paths come from `paths.go` (`appConfigPath` / `appLogPath`); the old `~/.bitfocus_listener.*` dotfiles are migrated on first run.
 2. **System Info**: CPU/memory/process metrics via gopsutil
 3. **WebSocket & Commands**: Auth, serialized writes, subscriptions, command handling
 4. **Key Access Control**: Category-based and individual key whitelisting
