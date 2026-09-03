@@ -235,12 +235,14 @@ jobs:
 
       - name: Determine files to upload
         id: filenames
-        shell: bash
+        # Compress-Archive is used rather than zip/7z, as it is the only zip tool
+        # guaranteed to be present on both the hosted and self-hosted runners.
+        shell: pwsh
         run: |
-          mv build bitfocus-listener
-          tar -czf "${{ steps.build.outputs.OUTPUT_FILENAME }}.tar.gz" bitfocus-listener
-          echo "sourcename=${{ steps.build.outputs.OUTPUT_FILENAME }}.tar.gz" >> $GITHUB_OUTPUT
-          echo "targetname=${{ steps.build.outputs.OUTPUT_FILENAME }}.tar.gz" >> $GITHUB_OUTPUT
+          Rename-Item build bitfocus-listener
+          Compress-Archive -Path bitfocus-listener -DestinationPath "${{ steps.build.outputs.OUTPUT_FILENAME }}"
+          "sourcename=${{ steps.build.outputs.OUTPUT_FILENAME }}" >> $env:GITHUB_OUTPUT
+          "targetname=${{ steps.build.outputs.OUTPUT_FILENAME }}" >> $env:GITHUB_OUTPUT
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7

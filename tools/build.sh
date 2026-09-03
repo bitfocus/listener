@@ -34,7 +34,8 @@ updateVersionFiles
 case $PLATFORM in
 	windows)
 		NAME="$PROGRAM-win"
-		EXT="exe"
+		# The windows build is a folder (exe + dlls + licenses), which CI zips up.
+		EXT="zip"
 		BINARY="$PROGRAM.exe"
 		export GOOS=windows
 		export EXTRAFLAGS="-ldflags -H=windowsgui"
