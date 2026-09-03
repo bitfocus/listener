@@ -5,6 +5,8 @@ permissions:
   contents: read
 
 env:
+  # RELEASE_S3_HOST is virtual-hosted, so the `s3-bucket` input is really a key
+  # prefix; RELEASE_S3_BASEPATH already includes the product segment.
   API_PRODUCT: listener
 
 jobs:
@@ -69,10 +71,12 @@ jobs:
         with:
           source-filename: ${{ steps.filenames.outputs.sourcename }}
           destination-filename: ${{ steps.filenames.outputs.targetname }}
-          s3-host: ${{ vars.S3_HOST }}
-          s3-bucket: ${{ vars.S3_BUCKET }}/${{ env.API_PRODUCT }}
-          s3-access-key: ${{ secrets.S3_KEY }}
-          s3-secret-key: ${{ secrets.S3_SECRET }}
+          s3-host: ${{ vars.RELEASE_S3_HOST }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}/beta
+          s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
+          s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
+
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/beta
 
           api-version: ${{ steps.build.outputs.VERSION }}
           api-branch: "beta"
@@ -86,11 +90,11 @@ jobs:
           source-filename: ${{ steps.filenames.outputs.sourcename }}
           destination-filename: ${{ steps.filenames.outputs.targetname }}
           s3-host: ${{ vars.RELEASE_S3_HOST }}
-          s3-bucket: ${{ vars.RELEASE_S3_BUCKET }}/${{ env.API_PRODUCT }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}
           s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
           s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
 
-          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/${{ env.API_PRODUCT }}
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}
 
           api-version: ${{ github.ref_name }}
           api-branch: "stable"
@@ -155,10 +159,12 @@ jobs:
         with:
           source-filename: ${{ steps.filenames.outputs.sourcename }}
           destination-filename: ${{ steps.filenames.outputs.targetname }}
-          s3-host: ${{ vars.S3_HOST }}
-          s3-bucket: ${{ vars.S3_BUCKET }}/${{ env.API_PRODUCT }}
-          s3-access-key: ${{ secrets.S3_KEY }}
-          s3-secret-key: ${{ secrets.S3_SECRET }}
+          s3-host: ${{ vars.RELEASE_S3_HOST }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}/beta
+          s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
+          s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
+
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/beta
 
           api-version: ${{ steps.build.outputs.VERSION }}
           api-branch: "beta"
@@ -172,11 +178,11 @@ jobs:
           source-filename: ${{ steps.filenames.outputs.sourcename }}
           destination-filename: ${{ steps.filenames.outputs.targetname }}
           s3-host: ${{ vars.RELEASE_S3_HOST }}
-          s3-bucket: ${{ vars.RELEASE_S3_BUCKET }}/${{ env.API_PRODUCT }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}
           s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
           s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
 
-          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/${{ env.API_PRODUCT }}
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}
 
           api-version: ${{ github.ref_name }}
           api-branch: "stable"
@@ -248,10 +254,12 @@ jobs:
         with:
           source-filename: ${{ steps.filenames.outputs.sourcename }}
           destination-filename: ${{ steps.filenames.outputs.targetname }}
-          s3-host: ${{ vars.S3_HOST }}
-          s3-bucket: ${{ vars.S3_BUCKET }}/${{ env.API_PRODUCT }}
-          s3-access-key: ${{ secrets.S3_KEY }}
-          s3-secret-key: ${{ secrets.S3_SECRET }}
+          s3-host: ${{ vars.RELEASE_S3_HOST }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}/beta
+          s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
+          s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
+
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/beta
 
           api-version: ${{ steps.build.outputs.VERSION }}
           api-branch: "beta"
@@ -265,11 +273,11 @@ jobs:
           source-filename: ${{ steps.filenames.outputs.sourcename }}
           destination-filename: ${{ steps.filenames.outputs.targetname }}
           s3-host: ${{ vars.RELEASE_S3_HOST }}
-          s3-bucket: ${{ vars.RELEASE_S3_BUCKET }}/${{ env.API_PRODUCT }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}
           s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
           s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
 
-          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/${{ env.API_PRODUCT }}
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}
 
           api-version: ${{ github.ref_name }}
           api-branch: "stable"

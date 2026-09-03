@@ -38,13 +38,15 @@ case $PLATFORM in
 		BINARY="$PROGRAM.exe"
 		export GOOS=windows
 		export EXTRAFLAGS="-ldflags -H=windowsgui"
-		API_TARGET="win"
+		API_TARGET_X64="win-x64"
+		API_TARGET_ARM64="win-arm64"
 		;;
 	mac)
 		NAME="$PROGRAM-mac"
 		EXT="dmg"
 		BINARY="$PROGRAM"
-		API_TARGET="mac"
+		API_TARGET_X64="mac-intel"
+		API_TARGET_ARM64="mac-arm"
 		export GOOS=darwin
 		export MACOSX_DEPLOYMENT_TARGET=14
 		export CGO_LDFLAGS="$CGO_LDFLAGS -mmacosx-version-min=13.0"
@@ -63,13 +65,13 @@ case $ARCH in
 		export ARCH=amd64
 		export GOARCH=amd64
 		FILENAME="$NAME-x64"
-		API_TARGET="${API_TARGET}-intel"
+		API_TARGET="$API_TARGET_X64"
 		;;
 	ARM64)
 		ARCH=arm64
 		export GOARCH=arm64
 		FILENAME="$NAME-arm64"
-		API_TARGET="${API_TARGET}-arm"
+		API_TARGET="$API_TARGET_ARM64"
 		;;
 	*)
 		error "Unknown arch $ARCH"
