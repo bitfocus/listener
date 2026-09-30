@@ -209,6 +209,23 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # cgo needs gcc. windows-latest ships MinGW, but the self-hosted runner is
+      # bare, so fetch the MSYS2 project's own toolchain. It is extracted into
+      # RUNNER_TEMP, so nothing is left behind on the runner after the job.
+      - name: Setup MinGW (self-hosted)
+        id: msys2
+        if: ${{ runner.environment == 'self-hosted' }}
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+      - name: Add MinGW to PATH (self-hosted)
+        if: ${{ runner.environment == 'self-hosted' }}
+        shell: pwsh
+        run: |
+          "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin" >> $env:GITHUB_PATH
+
       - name: Check version matches tag
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         shell: bash
