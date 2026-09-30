@@ -88,6 +88,11 @@ function getVersion() {
 		export BRANCH="stable"
 	fi
 
+	# Branch names can contain slashes (e.g. feature/foo), which would end up in
+	# the version string and output filenames. Keep only characters that are
+	# valid in semver build metadata.
+	export BRANCH="${BRANCH//[^A-Za-z0-9.-]/-}"
+
 	# jq is used when available; fall back to sed so a plain clone builds without it.
 	if command -v jq >/dev/null 2>&1; then
 		CUR=$(jq -r .version "${__DIRNAME}/../version.json" 2>/dev/null)
