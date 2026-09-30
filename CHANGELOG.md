@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.13](https://github.com/bitfocus/listener/compare/v1.0.12...v1.0.13) (2026-09-30)
+
+
+### Bug Fixes
+
+* windows release builds ([#13](https://github.com/bitfocus/listener/issues/13)) ([fc7b307](https://github.com/bitfocus/listener/commit/fc7b3075e004b0ba84bc9dbc6345d0765dd5f771))
+
 ## [1.0.12](https://github.com/bitfocus/listener/compare/v1.0.11...v1.0.12) (2026-09-03)
 
 
