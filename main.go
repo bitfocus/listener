@@ -476,9 +476,15 @@ const authCooldown = 2 * time.Second
 const authLockout = 5 * time.Minute
 const shellTimeout = 60 * time.Second
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+// Pre-auth frames only need to carry an auth digest; the cap stops an
+// unauthenticated peer from forcing large allocations.
+const maxUnauthMessageSize = 4 * 1024
+const maxMessageSize = 1024 * 1024
+
+// The zero-value CheckOrigin is gorilla's same-origin check: non-browser clients
+// (no Origin header) pass, but a web page on another origin cannot open a
+// socket to us and burn the per-IP auth budget for local clients.
+var upgrader = websocket.Upgrader{}
 
 // Active WebSocket clients (for password rotate / broadcast disconnect).
 var (
@@ -870,6 +876,7 @@ func handleCommand(client *Client, cmd Command) {
 			// the digest matched.
 			if subtle.ConstantTimeCompare([]byte(cmd.Password), []byte(expected)) == 1 {
 				client.authenticated.Store(true)
+				client.Conn.SetReadLimit(maxMessageSize)
 				client.subMu.Lock()
 				client.Subscriptions = make(map[string]chan bool)
 				client.subMu.Unlock()
@@ -1303,6 +1310,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		IP:            remoteIP,
 		Subscriptions: make(map[string]chan bool),
 	}
+	conn.SetReadLimit(maxUnauthMessageSize)
 	registerClient(client)
 	defer unregisterClient(client)
 
