@@ -263,7 +263,9 @@ func (e AuditEntry) String() string {
 // AuditLogger holds an in-memory ring buffer and writes to a log file.
 type AuditLogger struct {
 	mu       sync.Mutex
-	entries  []AuditEntry
+	entries  [auditRingSize]AuditEntry
+	start    int // index of the oldest entry
+	count    int
 	seq      uint64
 	file     *os.File
 	filePath string
@@ -280,10 +282,7 @@ func initAuditLogger() error {
 	migrateLegacyFile(legacyHomePath(".bitfocus_listener.log"), logPath)
 	migrateLegacyFile(legacyHomePath(".bitfocus_listener.log.1"), logPath+".1")
 
-	a := &AuditLogger{
-		entries:  make([]AuditEntry, 0, auditRingSize),
-		filePath: logPath,
-	}
+	a := &AuditLogger{filePath: logPath}
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
@@ -337,11 +336,13 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Ring buffer: keep last auditRingSize entries
-	if len(a.entries) >= auditRingSize {
-		a.entries = a.entries[1:]
+	if a.count < auditRingSize {
+		a.entries[(a.start+a.count)%auditRingSize] = entry
+		a.count++
+	} else {
+		a.entries[a.start] = entry
+		a.start = (a.start + 1) % auditRingSize
 	}
-	a.entries = append(a.entries, entry)
 	a.seq++
 
 	// Write to file
@@ -365,8 +366,10 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 func (a *AuditLogger) Snapshot() ([]AuditEntry, uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	result := make([]AuditEntry, len(a.entries))
-	copy(result, a.entries)
+	result := make([]AuditEntry, a.count)
+	for i := range result {
+		result[i] = a.entries[(a.start+i)%auditRingSize]
+	}
 	return result, a.seq
 }
 
@@ -684,6 +687,13 @@ var darwinKeyCodes = map[string]int{
 	"f9": 101, "f10": 109, "f11": 103, "f12": 111,
 	"home": 115, "end": 119, "pageup": 116, "pagedown": 121,
 	"forwarddelete": 117, "fwd_delete": 117,
+	"f13": 105, "f14": 107, "f15": 113,
+	// Apple extended keyboards put Print Screen / Scroll Lock / Pause on
+	// F13-F15 and Insert on Help.
+	"print": 105, "printscreen": 105,
+	"scroll": 107, "scrolllock": 107, "scroll_lock": 107,
+	"break": 113, "pausebreak": 113, "pause_break": 113,
+	"insert": 114, "help": 114,
 }
 
 // robotgoKeyAliases maps Listener key names to robotgo's expected names.
@@ -768,10 +778,12 @@ func darwinModifiersClause(modifiers []string) string {
 	return " using {" + strings.Join(modifierStrs, ", ") + "}"
 }
 
-func runOsascript(script string) {
+func runOsascript(script string) error {
 	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 		log.Printf("osascript failed: %v", err)
+		return err
 	}
+	return nil
 }
 
 func darwinKeyTapScript(key string, modifiers []string) (string, bool) {
@@ -820,59 +832,83 @@ func isDarwinMediaKey(key string) bool {
 // darwinMediaTap handles volume/media keys that cannot use System Events key codes.
 // Posts NX aux-control events in-process via CoreGraphics so they inherit Listener's
 // Accessibility TCC grant (posting via osascript often fails as a different process).
-func darwinMediaTap(key string) {
-	if strings.EqualFold(key, "stop") {
-		log.Printf("Unsupported macOS media key (no system stop key): %q", key)
-		return
-	}
+func darwinMediaTap(key string, modifiers []string) error {
 	nx, ok := darwinNXMediaKeys[strings.ToLower(key)]
 	if !ok {
-		return
+		return fmt.Errorf("key %s is not supported on macOS", key)
 	}
-	postDarwinMediaKey(nx)
+	postDarwinMediaKey(nx, modifiers)
+	return nil
 }
 
 // tapKey sends a key press. On macOS this uses System Events / CoreGraphics media keys
 // (not robotgo) to avoid CGO SIGTRAP crashes from background goroutines.
-func tapKey(key string, modifiers ...string) {
+func tapKey(key string, modifiers ...string) error {
 	if runtime.GOOS == "darwin" {
-		if len(modifiers) == 0 && isDarwinMediaKey(key) {
-			darwinMediaTap(key)
-			return
+		if isDarwinMediaKey(key) {
+			return darwinMediaTap(key, modifiers)
 		}
-		if script, ok := darwinKeyTapScript(key, modifiers); ok {
-			runOsascript(script)
-			return
+		script, ok := darwinKeyTapScript(key, modifiers)
+		if !ok {
+			return fmt.Errorf("key %s is not supported on macOS", key)
 		}
-		log.Printf("Unsupported macOS key for AppleScript fallback: %q", key)
-		return
+		return runOsascript(script)
 	}
-	robotgo.KeyTap(normalizeRobotgoKey(key), toInterfaceSlice(normalizeRobotgoKeys(modifiers))...)
+	mods := normalizeRobotgoKeys(modifiers)
+	if vk, ok := virtualKeyCode(key); ok {
+		var err error
+		pressed := 0
+		for _, mod := range mods {
+			if err = robotgo.KeyDown(mod); err != nil {
+				break
+			}
+			pressed++
+		}
+		if err == nil {
+			sendVirtualKey(vk, true)
+			sendVirtualKey(vk, false)
+		}
+		for i := pressed - 1; i >= 0; i-- {
+			_ = robotgo.KeyUp(mods[i])
+		}
+		return err
+	}
+	return robotgo.KeyTap(normalizeRobotgoKey(key), toInterfaceSlice(mods)...)
 }
 
 // toggleKey sends key down/up. On macOS this uses System Events (osascript).
 // Media keys have no meaningful hold state; a down is treated as a tap and up is ignored.
-func toggleKey(key string, down bool) {
+func toggleKey(key string, down bool) error {
 	if runtime.GOOS == "darwin" {
 		if isDarwinMediaKey(key) {
 			if down {
-				darwinMediaTap(key)
+				return darwinMediaTap(key, nil)
 			}
-			return
+			return nil
 		}
-		if script, ok := darwinKeyToggleScript(key, down); ok {
-			runOsascript(script)
-			return
+		script, ok := darwinKeyToggleScript(key, down)
+		if !ok {
+			return fmt.Errorf("key %s is not supported on macOS", key)
 		}
-		log.Printf("Unsupported macOS key for AppleScript fallback: %q", key)
-		return
+		return runOsascript(script)
+	}
+	if vk, ok := virtualKeyCode(key); ok {
+		sendVirtualKey(vk, down)
+		return nil
 	}
 	key = normalizeRobotgoKey(key)
 	if down {
-		robotgo.KeyDown(key)
-	} else {
-		robotgo.KeyUp(key)
+		return robotgo.KeyDown(key)
 	}
+	return robotgo.KeyUp(key)
+}
+
+func sendKeyError(client *Client, err error) {
+	log.Printf("Key event failed: %v", err)
+	_ = client.writeJSON(map[string]interface{}{
+		"type":    "error",
+		"message": err.Error(),
+	})
 }
 
 // typeString types a string. On macOS this uses System Events keystroke via
@@ -1106,7 +1142,10 @@ func handleCommand(client *Client, cmd Command) {
 			return
 		}
 		auditLog(client.IP, "keyPress", fmt.Sprintf("key=%s", cmd.Key))
-		tapKey(cmd.Key)
+		if err := tapKey(cmd.Key); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Executed key tap: %v", cmd)
 
 	case "keyCombinationPress":
@@ -1114,7 +1153,10 @@ func handleCommand(client *Client, cmd Command) {
 			return
 		}
 		auditLog(client.IP, "keyCombinationPress", fmt.Sprintf("key=%s modifiers=%v", cmd.Key, cmd.Modifiers))
-		tapKey(cmd.Key, cmd.Modifiers...)
+		if err := tapKey(cmd.Key, cmd.Modifiers...); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Executed key tap with modifiers: %s + %v", cmd.Key, cmd.Modifiers)
 
 	case "keyDown":
@@ -1122,7 +1164,10 @@ func handleCommand(client *Client, cmd Command) {
 			return
 		}
 		auditLog(client.IP, "keyDown", fmt.Sprintf("key=%s", cmd.Key))
-		toggleKey(cmd.Key, true)
+		if err := toggleKey(cmd.Key, true); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Key down: %s", cmd.Key)
 
 	case "keyUp":
@@ -1130,7 +1175,10 @@ func handleCommand(client *Client, cmd Command) {
 			return
 		}
 		auditLog(client.IP, "keyUp", fmt.Sprintf("key=%s", cmd.Key))
-		toggleKey(cmd.Key, false)
+		if err := toggleKey(cmd.Key, false); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Key up: %s", cmd.Key)
 
 	case "osxKeyPressProcess":
@@ -1156,15 +1204,16 @@ func handleCommand(client *Client, cmd Command) {
 				})
 				return
 			}
+			script, ok := darwinKeyTapScript(cmd.Key, cmd.Modifiers)
+			if !ok {
+				sendKeyError(client, fmt.Errorf("key %s is not supported on macOS", cmd.Key))
+				return
+			}
 			auditLog(client.IP, "osxKeyPressProcess", fmt.Sprintf("process=%s key=%s modifiers=%v", cmd.ProcessName, cmd.Key, cmd.Modifiers))
-			processName, key, mods := cmd.ProcessName, cmd.Key, append([]string(nil), cmd.Modifiers...)
+			processName := cmd.ProcessName
 			go func() {
-				runOsascript(fmt.Sprintf("tell application %q to activate", processName))
-				if script, ok := darwinKeyTapScript(key, mods); ok {
-					runOsascript(script)
-				} else {
-					log.Printf("Unsupported macOS key for osxKeyPressProcess: %q", key)
-				}
+				_ = runOsascript(fmt.Sprintf("tell application %q to activate", processName))
+				_ = runOsascript(script)
 				log.Printf("Sent OSXKeyPressProcess command to %s", processName)
 			}()
 		} else {
@@ -1927,7 +1976,7 @@ var keyDisplayNames = map[string]string{
 	"print":      "Print Screen",
 	"scroll":     "Scroll Lock",
 	"pause":      "Pause",
-	"break":      "Break",
+	"break":      "Pause/Break",
 	"play":       "Play",
 	"stop":       "Stop",
 	"next":       "Next Track",
@@ -1971,6 +2020,12 @@ func normalizeKeyAlias(key string) string {
 		return "enter"
 	case "escape":
 		return "esc"
+	case "pausebreak", "pause_break":
+		return "break"
+	case "printscreen":
+		return "print"
+	case "scrolllock", "scroll_lock":
+		return "scroll"
 	default:
 		return key
 	}
