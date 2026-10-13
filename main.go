@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -166,13 +167,25 @@ func loadConfig() error {
 	if config.KeyCategories == nil {
 		config.KeyCategories = make(map[string]bool)
 	}
-	storedPassword = config.Password
+	dirty := false
+	// Commands added after this config was written stay off until the user
+	// enables them; record that explicitly rather than relying on a missing key.
+	for _, cmd := range defaultCommands {
+		if _, ok := config.AllowedCommands[cmd]; !ok {
+			log.Printf("New command %s is disabled; enable it under Allowed Remote Actions", cmd)
+			config.AllowedCommands[cmd] = false
+			dirty = true
+		}
+	}
 	// An empty password would make the expected digest MD5(salt), which any
 	// client can compute from the challenge.
 	if config.Password == "" {
 		log.Println("Config has no password; generating a new one")
 		config.Password = generatePassword()
-		storedPassword = config.Password
+		dirty = true
+	}
+	storedPassword = config.Password
+	if dirty {
 		return saveConfig(&config)
 	}
 	return nil
@@ -489,10 +502,40 @@ const shellTimeout = 60 * time.Second
 const maxUnauthMessageSize = 4 * 1024
 const maxMessageSize = 1024 * 1024
 
-// The zero-value CheckOrigin is gorilla's same-origin check: non-browser clients
-// (no Origin header) pass, but a web page on another origin cannot open a
-// socket to us and burn the per-IP auth budget for local clients.
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{CheckOrigin: checkOrigin}
+
+// checkOrigin lets non-browser clients (no Origin header) through. Browser
+// requests must be same-origin and addressed to an IP literal or one of this
+// machine's own names; a DNS-rebinding page is same-origin under its own domain,
+// so the host check is what stops it.
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || !strings.EqualFold(u.Host, r.Host) {
+		return false
+	}
+	return isLocalHostName(r.Host)
+}
+
+func isLocalHostName(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if net.ParseIP(host) != nil || host == "localhost" {
+		return true
+	}
+	name, err := os.Hostname()
+	if err != nil {
+		return false
+	}
+	base := strings.TrimSuffix(strings.ToLower(name), ".local")
+	return host == base || host == base+".local"
+}
 
 // Active WebSocket clients (for password rotate / broadcast disconnect).
 var (
@@ -532,19 +575,36 @@ type authBucket struct {
 }
 
 var (
-	authMu   sync.Mutex
-	authByIP = map[string]*authBucket{}
+	authMu        sync.Mutex
+	authByIP      = map[string]*authBucket{}
+	lastAuthPrune time.Time
 )
 
-func checkAuthRateLimit(ip string) (ok bool, message string) {
-	authMu.Lock()
-	defer authMu.Unlock()
+// authBucketLocked returns ip's bucket, first dropping buckets idle for longer
+// than a lockout (at most once a minute) so the map cannot grow without bound.
+// Caller must hold authMu.
+func authBucketLocked(ip string, now time.Time) *authBucket {
+	if now.Sub(lastAuthPrune) > time.Minute {
+		lastAuthPrune = now
+		for k, b := range authByIP {
+			if now.After(b.lockedUntil) && now.Sub(b.last) > authLockout {
+				delete(authByIP, k)
+			}
+		}
+	}
 	b := authByIP[ip]
 	if b == nil {
 		b = &authBucket{}
 		authByIP[ip] = b
 	}
+	return b
+}
+
+func checkAuthRateLimit(ip string) (ok bool, message string) {
+	authMu.Lock()
+	defer authMu.Unlock()
 	now := time.Now()
+	b := authBucketLocked(ip, now)
 	if now.Before(b.lockedUntil) {
 		return false, "Too many auth attempts"
 	}
@@ -563,13 +623,10 @@ func checkAuthRateLimit(ip string) (ok bool, message string) {
 func recordAuthFailure(ip string) {
 	authMu.Lock()
 	defer authMu.Unlock()
-	b := authByIP[ip]
-	if b == nil {
-		b = &authBucket{}
-		authByIP[ip] = b
-	}
+	now := time.Now()
+	b := authBucketLocked(ip, now)
 	b.attempts++
-	b.last = time.Now()
+	b.last = now
 }
 
 func clearAuthRateLimit(ip string) {
@@ -879,21 +936,27 @@ func handleCommand(client *Client, cmd Command) {
 	logCommand(cmd)
 	if !client.authenticated.Load() {
 		if cmd.Type == "auth" {
-			if ok, msg := checkAuthRateLimit(client.IP); !ok {
-				log.Printf("Auth rate limited for %s: %s", client.IP, msg)
-				auditLog(client.IP, "AUTH_RATE_LIMITED", msg)
-				_ = client.writeJSON(map[string]interface{}{
-					"type":    "authResponse",
-					"status":  "failed",
-					"message": msg,
-				})
-				return
-			}
-
 			expected := computeMD5(client.Salt + currentPassword())
 			// Constant-time compare so response timing cannot leak how much of
 			// the digest matched.
-			if subtle.ConstantTimeCompare([]byte(cmd.Password), []byte(expected)) == 1 {
+			matched := subtle.ConstantTimeCompare([]byte(cmd.Password), []byte(expected)) == 1
+			// The rate limit gates failures only. Peers behind one IP share a
+			// bucket, so letting a correct digest through means a misbehaving
+			// neighbor cannot lock out a legitimate client; with 128-bit
+			// generated passwords the extra guesses this allows are irrelevant.
+			if !matched {
+				if ok, msg := checkAuthRateLimit(client.IP); !ok {
+					log.Printf("Auth rate limited for %s: %s", client.IP, msg)
+					auditLog(client.IP, "AUTH_RATE_LIMITED", msg)
+					_ = client.writeJSON(map[string]interface{}{
+						"type":    "authResponse",
+						"status":  "failed",
+						"message": msg,
+					})
+					return
+				}
+			}
+			if matched {
 				client.authenticated.Store(true)
 				client.Conn.SetReadLimit(maxMessageSize)
 				client.subMu.Lock()
