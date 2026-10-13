@@ -88,7 +88,18 @@ var connectionStatusBg *canvas.Rectangle
 var listenStatusText *canvas.Text
 var listenDetailText *canvas.Text
 var listenStatusBg *canvas.Rectangle
-var refreshTrayMenu func()
+var refreshTrayMenu func(status string)
+
+// guiStarted is set once the Fyne app exists; fyne.Do needs a current app.
+var guiStarted atomic.Bool
+
+// uiDo runs fn on the Fyne main goroutine. Before the GUI exists there is
+// nothing to update, and startGUI renders the current state itself.
+func uiDo(fn func()) {
+	if guiStarted.Load() {
+		fyne.Do(fn)
+	}
+}
 
 var bindStatusMu sync.Mutex
 var lastBindError error
@@ -1546,20 +1557,21 @@ func refreshConnectionStatus() {
 		col = theme.ErrorColor()
 	}
 	connectionStatus = status
-	if connectionStatusText != nil {
-		connectionStatusText.Text = status
-		connectionStatusText.Color = col
-		canvas.Refresh(connectionStatusText)
-	}
-	if connectionDetailText != nil {
-		connectionDetailText.Text = detail
-		canvas.Refresh(connectionDetailText)
-	}
-	setStatusCardBg(connectionStatusBg, ok)
-	// Tray menu rebuild takes connMu; run outside this lock.
-	if refreshTrayMenu != nil {
-		go refreshTrayMenu()
-	}
+	uiDo(func() {
+		if connectionStatusText != nil {
+			connectionStatusText.Text = status
+			connectionStatusText.Color = col
+			canvas.Refresh(connectionStatusText)
+		}
+		if connectionDetailText != nil {
+			connectionDetailText.Text = detail
+			canvas.Refresh(connectionDetailText)
+		}
+		setStatusCardBg(connectionStatusBg, ok)
+		if refreshTrayMenu != nil {
+			refreshTrayMenu(status)
+		}
+	})
 }
 
 func setBindResult(addr string, err error) {
@@ -1571,9 +1583,6 @@ func setBindResult(addr string, err error) {
 }
 
 func refreshListenStatusUI() {
-	if listenStatusText == nil {
-		return
-	}
 	bindStatusMu.Lock()
 	err := lastBindError
 	addr := lastBindAddr
@@ -1583,24 +1592,29 @@ func refreshListenStatusUI() {
 		addr = config.Interface + ":" + config.Port
 		configMu.RUnlock()
 	}
-	ok := err == nil
-	if !ok {
-		listenStatusText.Text = "Bind failed"
-		listenStatusText.Color = theme.ErrorColor()
-		if listenDetailText != nil {
-			listenDetailText.Text = err.Error()
-			canvas.Refresh(listenDetailText)
+	uiDo(func() {
+		if listenStatusText == nil {
+			return
 		}
-	} else {
-		listenStatusText.Text = "Listening"
-		listenStatusText.Color = theme.SuccessColor()
-		if listenDetailText != nil {
-			listenDetailText.Text = addr
-			canvas.Refresh(listenDetailText)
+		ok := err == nil
+		if !ok {
+			listenStatusText.Text = "Bind failed"
+			listenStatusText.Color = theme.ErrorColor()
+			if listenDetailText != nil {
+				listenDetailText.Text = err.Error()
+				canvas.Refresh(listenDetailText)
+			}
+		} else {
+			listenStatusText.Text = "Listening"
+			listenStatusText.Color = theme.SuccessColor()
+			if listenDetailText != nil {
+				listenDetailText.Text = addr
+				canvas.Refresh(listenDetailText)
+			}
 		}
-	}
-	canvas.Refresh(listenStatusText)
-	setStatusCardBg(listenStatusBg, ok)
+		canvas.Refresh(listenStatusText)
+		setStatusCardBg(listenStatusBg, ok)
+	})
 }
 
 func preferredLocalIP() string {
@@ -1649,7 +1663,7 @@ func websocketTargetHost() string {
 func flashButtonText(btn *widget.Button, temp, original string) {
 	btn.SetText(temp)
 	time.AfterFunc(1500*time.Millisecond, func() {
-		btn.SetText(original)
+		fyne.Do(func() { btn.SetText(original) })
 	})
 }
 
@@ -1659,7 +1673,7 @@ func flashLabelText(lbl *widget.Label, temp, original string) {
 	}
 	lbl.SetText(temp)
 	time.AfterFunc(1500*time.Millisecond, func() {
-		lbl.SetText(original)
+		fyne.Do(func() { lbl.SetText(original) })
 	})
 }
 
@@ -2254,24 +2268,9 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 
 func showActivityLogDialog(parent fyne.Window) {
 	type logRow struct{ stamp, message, full string }
-	// lines is swapped by the refresh ticker goroutine and read by list callbacks
-	// on the UI thread.
-	var linesMu sync.Mutex
 	var lines []logRow
-	lineAt := func(i int) (logRow, bool) {
-		linesMu.Lock()
-		defer linesMu.Unlock()
-		if i < 0 || i >= len(lines) {
-			return logRow{}, false
-		}
-		return lines[i], true
-	}
 	logList := widget.NewList(
-		func() int {
-			linesMu.Lock()
-			defer linesMu.Unlock()
-			return len(lines)
-		},
+		func() int { return len(lines) },
 		func() fyne.CanvasObject {
 			stamp := widget.NewRichText(&widget.TextSegment{
 				Style: widget.RichTextStyle{
@@ -2286,10 +2285,7 @@ func showActivityLogDialog(parent fyne.Window) {
 			return container.NewBorder(nil, nil, stamp, nil, msg)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			row, ok := lineAt(i)
-			if !ok {
-				return
-			}
+			row := lines[i]
 			objs := o.(*fyne.Container).Objects
 			msg := objs[0].(*widget.Label)
 			stamp := objs[1].(*widget.RichText)
@@ -2302,8 +2298,8 @@ func showActivityLogDialog(parent fyne.Window) {
 	// Selecting a row copies the full line. Unselect immediately so the same
 	// row can be copied again and no stale highlight survives a refresh.
 	logList.OnSelected = func(i widget.ListItemID) {
-		if row, ok := lineAt(i); ok {
-			parent.Clipboard().SetContent(row.full)
+		if i < len(lines) {
+			parent.Clipboard().SetContent(lines[i].full)
 			flashLabelText(copyHint, "Copied line to clipboard", "Click a line to copy it.")
 		}
 		logList.UnselectAll()
@@ -2324,11 +2320,9 @@ func showActivityLogDialog(parent fyne.Window) {
 				full:    e.String(),
 			})
 		}
-		linesMu.Lock()
 		lines = next
-		linesMu.Unlock()
 		logList.Refresh()
-		if len(next) > 0 {
+		if len(lines) > 0 {
 			logList.ScrollToBottom()
 		}
 	}
@@ -2344,7 +2338,7 @@ func showActivityLogDialog(parent fyne.Window) {
 		for {
 			select {
 			case <-ticker.C:
-				refreshLog()
+				fyne.Do(refreshLog)
 			case <-done:
 				return
 			}
@@ -2392,6 +2386,7 @@ func showActivityLogDialog(parent fyne.Window) {
 
 func startGUI() {
 	myApp := app.New()
+	guiStarted.Store(true)
 	appIcon := fyne.NewStaticResource("icon.png", iconPNG)
 	myApp.SetIcon(appIcon)
 	w := myApp.NewWindow("Bitfocus Listener")
@@ -2400,27 +2395,28 @@ func startGUI() {
 	// calls OnChanged from SetSelected, which previously restarted the server
 	// on every launch and dropped WebSocket connections.
 	guiReady := false
-	// Written from restartServer's goroutine, read by the Validator on the UI thread.
-	var errorState atomic.Value
-	errorState.Store("")
+	var errorState string
 
 	portEntry := widget.NewEntry()
 	portEntry.SetText(config.Port)
 	portEntry.Validator = func(string) error {
-		if msg := errorState.Load().(string); msg != "" {
-			return errors.New(msg)
+		if errorState != "" {
+			return errors.New(errorState)
 		}
 		return nil
 	}
 
+	// Called from restartServer's goroutine.
 	applyBindUI := func(err error) {
-		if err != nil {
-			errorState.Store(err.Error())
-		} else {
-			errorState.Store("")
-		}
-		refreshListenStatusUI()
-		portEntry.Validate()
+		fyne.Do(func() {
+			if err != nil {
+				errorState = err.Error()
+			} else {
+				errorState = ""
+			}
+			refreshListenStatusUI()
+			portEntry.Validate()
+		})
 	}
 
 	restartWithCurrentBind := func() {
@@ -2460,13 +2456,10 @@ func startGUI() {
 		trayHint.Text = "Quit from the window close button when tray is unavailable."
 	}
 
-	buildTrayMenu := func() {
+	buildTrayMenu := func(status string) {
 		if deskApp == nil {
 			return
 		}
-		connMu.Lock()
-		status := connectionStatus
-		connMu.Unlock()
 		statusItem := fyne.NewMenuItem(status, nil)
 		statusItem.Disabled = true
 		quitItem := fyne.NewMenuItem("Quit", func() { myApp.Quit() })
@@ -2491,7 +2484,10 @@ func startGUI() {
 		))
 	}
 	refreshTrayMenu = buildTrayMenu
-	buildTrayMenu()
+	connMu.Lock()
+	initialStatus := connectionStatus
+	connMu.Unlock()
+	buildTrayMenu(initialStatus)
 
 	w.SetCloseIntercept(func() {
 		if trayEnabled {
