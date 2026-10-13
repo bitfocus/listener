@@ -29,9 +29,9 @@ import (
 
 	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/mem"
-	"github.com/shirou/gopsutil/process"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/mem"
+	"github.com/shirou/gopsutil/v4/process"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
