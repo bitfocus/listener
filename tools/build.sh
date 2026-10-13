@@ -50,8 +50,8 @@ case $PLATFORM in
 		API_TARGET_ARM64="mac-arm"
 		export GOOS=darwin
 		export MACOSX_DEPLOYMENT_TARGET=14
-		export CGO_LDFLAGS="$CGO_LDFLAGS -mmacosx-version-min=13.0"
-		export CGO_CFLAGS="$CGO_CFLAGS -mmacosx-version-min=13.0"
+		export CGO_LDFLAGS="$CGO_LDFLAGS -mmacosx-version-min=14.0"
+		export CGO_CFLAGS="$CGO_CFLAGS -mmacosx-version-min=14.0"
 		;;
 	linux)
 		error "Linux is not supported right now"

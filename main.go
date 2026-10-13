@@ -51,12 +51,12 @@ import (
 //go:embed icon.png
 var iconPNG []byte
 
-// trayIconPNG is the monochrome menu-bar/tray glyph. It is a macOS template
+// trayIconSVG is the monochrome menu-bar/tray glyph. It is a macOS template
 // image (shape carried entirely in the alpha channel) so the system can tint
 // it for light/dark menu bars.
 //
-//go:embed tray_icon.png
-var trayIconPNG []byte
+//go:embed tray_icon.svg
+var trayIconSVG []byte
 
 // -------------------------
 // Configuration Handling
