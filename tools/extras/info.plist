@@ -20,8 +20,8 @@
     <string>Icon</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
-    <key>MinimumOSVersion</key>
-    <string>13</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
     <key>HumanReadableCopyright</key>
     <string>© Copyright %YEAR% Bitfocus AS</string>
     <key>CFBundleShortVersionString</key>

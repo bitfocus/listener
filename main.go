@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -28,9 +29,9 @@ import (
 
 	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/mem"
-	"github.com/shirou/gopsutil/process"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/mem"
+	"github.com/shirou/gopsutil/v4/process"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -50,12 +51,12 @@ import (
 //go:embed icon.png
 var iconPNG []byte
 
-// trayIconPNG is the monochrome menu-bar/tray glyph. It is a macOS template
+// trayIconSVG is the monochrome menu-bar/tray glyph. It is a macOS template
 // image (shape carried entirely in the alpha channel) so the system can tint
 // it for light/dark menu bars.
 //
-//go:embed tray_icon.png
-var trayIconPNG []byte
+//go:embed tray_icon.svg
+var trayIconSVG []byte
 
 // -------------------------
 // Configuration Handling
@@ -87,7 +88,18 @@ var connectionStatusBg *canvas.Rectangle
 var listenStatusText *canvas.Text
 var listenDetailText *canvas.Text
 var listenStatusBg *canvas.Rectangle
-var refreshTrayMenu func()
+var refreshTrayMenu func(status string)
+
+// guiStarted is set once the Fyne app exists; fyne.Do needs a current app.
+var guiStarted atomic.Bool
+
+// uiDo runs fn on the Fyne main goroutine. Before the GUI exists there is
+// nothing to update, and startGUI renders the current state itself.
+func uiDo(fn func()) {
+	if guiStarted.Load() {
+		fyne.Do(fn)
+	}
+}
 
 var bindStatusMu sync.Mutex
 var lastBindError error
@@ -166,7 +178,27 @@ func loadConfig() error {
 	if config.KeyCategories == nil {
 		config.KeyCategories = make(map[string]bool)
 	}
+	dirty := false
+	// Commands added after this config was written stay off until the user
+	// enables them; record that explicitly rather than relying on a missing key.
+	for _, cmd := range defaultCommands {
+		if _, ok := config.AllowedCommands[cmd]; !ok {
+			log.Printf("New command %s is disabled; enable it under Allowed Remote Actions", cmd)
+			config.AllowedCommands[cmd] = false
+			dirty = true
+		}
+	}
+	// An empty password would make the expected digest MD5(salt), which any
+	// client can compute from the challenge.
+	if config.Password == "" {
+		log.Println("Config has no password; generating a new one")
+		config.Password = generatePassword()
+		dirty = true
+	}
 	storedPassword = config.Password
+	if dirty {
+		return saveConfig(&config)
+	}
 	return nil
 }
 
@@ -242,7 +274,9 @@ func (e AuditEntry) String() string {
 // AuditLogger holds an in-memory ring buffer and writes to a log file.
 type AuditLogger struct {
 	mu       sync.Mutex
-	entries  []AuditEntry
+	entries  [auditRingSize]AuditEntry
+	start    int // index of the oldest entry
+	count    int
 	seq      uint64
 	file     *os.File
 	filePath string
@@ -259,10 +293,7 @@ func initAuditLogger() error {
 	migrateLegacyFile(legacyHomePath(".bitfocus_listener.log"), logPath)
 	migrateLegacyFile(legacyHomePath(".bitfocus_listener.log.1"), logPath+".1")
 
-	a := &AuditLogger{
-		entries:  make([]AuditEntry, 0, auditRingSize),
-		filePath: logPath,
-	}
+	a := &AuditLogger{filePath: logPath}
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
@@ -316,11 +347,13 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Ring buffer: keep last auditRingSize entries
-	if len(a.entries) >= auditRingSize {
-		a.entries = a.entries[1:]
+	if a.count < auditRingSize {
+		a.entries[(a.start+a.count)%auditRingSize] = entry
+		a.count++
+	} else {
+		a.entries[a.start] = entry
+		a.start = (a.start + 1) % auditRingSize
 	}
-	a.entries = append(a.entries, entry)
 	a.seq++
 
 	// Write to file
@@ -344,8 +377,10 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 func (a *AuditLogger) Snapshot() ([]AuditEntry, uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	result := make([]AuditEntry, len(a.entries))
-	copy(result, a.entries)
+	result := make([]AuditEntry, a.count)
+	for i := range result {
+		result[i] = a.entries[(a.start+i)%auditRingSize]
+	}
 	return result, a.seq
 }
 
@@ -476,8 +511,44 @@ const authCooldown = 2 * time.Second
 const authLockout = 5 * time.Minute
 const shellTimeout = 60 * time.Second
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+// Pre-auth frames only need to carry an auth digest; the cap stops an
+// unauthenticated peer from forcing large allocations.
+const maxUnauthMessageSize = 4 * 1024
+const maxMessageSize = 1024 * 1024
+
+var upgrader = websocket.Upgrader{CheckOrigin: checkOrigin}
+
+// checkOrigin lets non-browser clients (no Origin header) through. Browser
+// requests must be same-origin and addressed to an IP literal or one of this
+// machine's own names; a DNS-rebinding page is same-origin under its own domain,
+// so the host check is what stops it.
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || !strings.EqualFold(u.Host, r.Host) {
+		return false
+	}
+	return isLocalHostName(r.Host)
+}
+
+func isLocalHostName(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if net.ParseIP(host) != nil || host == "localhost" {
+		return true
+	}
+	name, err := os.Hostname()
+	if err != nil {
+		return false
+	}
+	base := strings.TrimSuffix(strings.ToLower(name), ".local")
+	return host == base || host == base+".local"
 }
 
 // Active WebSocket clients (for password rotate / broadcast disconnect).
@@ -518,19 +589,36 @@ type authBucket struct {
 }
 
 var (
-	authMu   sync.Mutex
-	authByIP = map[string]*authBucket{}
+	authMu        sync.Mutex
+	authByIP      = map[string]*authBucket{}
+	lastAuthPrune time.Time
 )
 
-func checkAuthRateLimit(ip string) (ok bool, message string) {
-	authMu.Lock()
-	defer authMu.Unlock()
+// authBucketLocked returns ip's bucket, first dropping buckets idle for longer
+// than a lockout (at most once a minute) so the map cannot grow without bound.
+// Caller must hold authMu.
+func authBucketLocked(ip string, now time.Time) *authBucket {
+	if now.Sub(lastAuthPrune) > time.Minute {
+		lastAuthPrune = now
+		for k, b := range authByIP {
+			if now.After(b.lockedUntil) && now.Sub(b.last) > authLockout {
+				delete(authByIP, k)
+			}
+		}
+	}
 	b := authByIP[ip]
 	if b == nil {
 		b = &authBucket{}
 		authByIP[ip] = b
 	}
+	return b
+}
+
+func checkAuthRateLimit(ip string) (ok bool, message string) {
+	authMu.Lock()
+	defer authMu.Unlock()
 	now := time.Now()
+	b := authBucketLocked(ip, now)
 	if now.Before(b.lockedUntil) {
 		return false, "Too many auth attempts"
 	}
@@ -549,13 +637,10 @@ func checkAuthRateLimit(ip string) (ok bool, message string) {
 func recordAuthFailure(ip string) {
 	authMu.Lock()
 	defer authMu.Unlock()
-	b := authByIP[ip]
-	if b == nil {
-		b = &authBucket{}
-		authByIP[ip] = b
-	}
+	now := time.Now()
+	b := authBucketLocked(ip, now)
 	b.attempts++
-	b.last = time.Now()
+	b.last = now
 }
 
 func clearAuthRateLimit(ip string) {
@@ -613,6 +698,13 @@ var darwinKeyCodes = map[string]int{
 	"f9": 101, "f10": 109, "f11": 103, "f12": 111,
 	"home": 115, "end": 119, "pageup": 116, "pagedown": 121,
 	"forwarddelete": 117, "fwd_delete": 117,
+	"f13": 105, "f14": 107, "f15": 113,
+	// Apple extended keyboards put Print Screen / Scroll Lock / Pause on
+	// F13-F15 and Insert on Help.
+	"print": 105, "printscreen": 105,
+	"scroll": 107, "scrolllock": 107, "scroll_lock": 107,
+	"break": 113, "pausebreak": 113, "pause_break": 113,
+	"insert": 114, "help": 114,
 }
 
 // robotgoKeyAliases maps Listener key names to robotgo's expected names.
@@ -697,10 +789,12 @@ func darwinModifiersClause(modifiers []string) string {
 	return " using {" + strings.Join(modifierStrs, ", ") + "}"
 }
 
-func runOsascript(script string) {
+func runOsascript(script string) error {
 	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 		log.Printf("osascript failed: %v", err)
+		return err
 	}
+	return nil
 }
 
 func darwinKeyTapScript(key string, modifiers []string) (string, bool) {
@@ -749,59 +843,83 @@ func isDarwinMediaKey(key string) bool {
 // darwinMediaTap handles volume/media keys that cannot use System Events key codes.
 // Posts NX aux-control events in-process via CoreGraphics so they inherit Listener's
 // Accessibility TCC grant (posting via osascript often fails as a different process).
-func darwinMediaTap(key string) {
-	if strings.EqualFold(key, "stop") {
-		log.Printf("Unsupported macOS media key (no system stop key): %q", key)
-		return
-	}
+func darwinMediaTap(key string, modifiers []string) error {
 	nx, ok := darwinNXMediaKeys[strings.ToLower(key)]
 	if !ok {
-		return
+		return fmt.Errorf("key %s is not supported on macOS", key)
 	}
-	postDarwinMediaKey(nx)
+	postDarwinMediaKey(nx, modifiers)
+	return nil
 }
 
 // tapKey sends a key press. On macOS this uses System Events / CoreGraphics media keys
 // (not robotgo) to avoid CGO SIGTRAP crashes from background goroutines.
-func tapKey(key string, modifiers ...string) {
+func tapKey(key string, modifiers ...string) error {
 	if runtime.GOOS == "darwin" {
-		if len(modifiers) == 0 && isDarwinMediaKey(key) {
-			darwinMediaTap(key)
-			return
+		if isDarwinMediaKey(key) {
+			return darwinMediaTap(key, modifiers)
 		}
-		if script, ok := darwinKeyTapScript(key, modifiers); ok {
-			runOsascript(script)
-			return
+		script, ok := darwinKeyTapScript(key, modifiers)
+		if !ok {
+			return fmt.Errorf("key %s is not supported on macOS", key)
 		}
-		log.Printf("Unsupported macOS key for AppleScript fallback: %q", key)
-		return
+		return runOsascript(script)
 	}
-	robotgo.KeyTap(normalizeRobotgoKey(key), toInterfaceSlice(normalizeRobotgoKeys(modifiers))...)
+	mods := normalizeRobotgoKeys(modifiers)
+	if vk, ok := virtualKeyCode(key); ok {
+		var err error
+		pressed := 0
+		for _, mod := range mods {
+			if err = robotgo.KeyDown(mod); err != nil {
+				break
+			}
+			pressed++
+		}
+		if err == nil {
+			sendVirtualKey(vk, true)
+			sendVirtualKey(vk, false)
+		}
+		for i := pressed - 1; i >= 0; i-- {
+			_ = robotgo.KeyUp(mods[i])
+		}
+		return err
+	}
+	return robotgo.KeyTap(normalizeRobotgoKey(key), toInterfaceSlice(mods)...)
 }
 
 // toggleKey sends key down/up. On macOS this uses System Events (osascript).
 // Media keys have no meaningful hold state; a down is treated as a tap and up is ignored.
-func toggleKey(key string, down bool) {
+func toggleKey(key string, down bool) error {
 	if runtime.GOOS == "darwin" {
 		if isDarwinMediaKey(key) {
 			if down {
-				darwinMediaTap(key)
+				return darwinMediaTap(key, nil)
 			}
-			return
+			return nil
 		}
-		if script, ok := darwinKeyToggleScript(key, down); ok {
-			runOsascript(script)
-			return
+		script, ok := darwinKeyToggleScript(key, down)
+		if !ok {
+			return fmt.Errorf("key %s is not supported on macOS", key)
 		}
-		log.Printf("Unsupported macOS key for AppleScript fallback: %q", key)
-		return
+		return runOsascript(script)
+	}
+	if vk, ok := virtualKeyCode(key); ok {
+		sendVirtualKey(vk, down)
+		return nil
 	}
 	key = normalizeRobotgoKey(key)
 	if down {
-		robotgo.KeyDown(key)
-	} else {
-		robotgo.KeyUp(key)
+		return robotgo.KeyDown(key)
 	}
+	return robotgo.KeyUp(key)
+}
+
+func sendKeyError(client *Client, err error) {
+	log.Printf("Key event failed: %v", err)
+	_ = client.writeJSON(map[string]interface{}{
+		"type":    "error",
+		"message": err.Error(),
+	})
 }
 
 // typeString types a string. On macOS this uses System Events keystroke via
@@ -834,42 +952,60 @@ func normalizeLegacyCommand(cmd *Command) {
 	}
 }
 
+// keysAllowed reports whether key and all modifiers pass key access control,
+// auditing and replying with an error for the first one that does not.
+func keysAllowed(client *Client, cmdType, key string, modifiers []string) bool {
+	if !isKeyAllowed(key) {
+		log.Printf("Key %s is not allowed", key)
+		auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("%s key=%s", cmdType, key))
+		_ = client.writeJSON(map[string]interface{}{
+			"type":    "error",
+			"message": "Key " + key + " is not allowed",
+		})
+		return false
+	}
+	for _, modifier := range modifiers {
+		if !isKeyAllowed(modifier) {
+			log.Printf("Modifier %s is not allowed", modifier)
+			auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("%s modifier=%s", cmdType, modifier))
+			_ = client.writeJSON(map[string]interface{}{
+				"type":    "error",
+				"message": "Modifier " + modifier + " is not allowed",
+			})
+			return false
+		}
+	}
+	return true
+}
+
 // Updated handleCommand with unified subscription handling.
 func handleCommand(client *Client, cmd Command) {
 	logCommand(cmd)
-	// Allow auth command regardless.
-	if cmd.Type != "auth" && cmd.Type != "unsubscribe" {
-		configMu.RLock()
-		allowed, exists := config.AllowedCommands[cmd.Type]
-		configMu.RUnlock()
-		if !exists || !allowed {
-			log.Printf("Command %s is disabled", cmd.Type)
-			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s is disabled", cmd.Type))
-			_ = client.writeJSON(map[string]interface{}{
-				"type":    "error",
-				"message": "Command " + cmd.Type + " is disabled on the server",
-			})
-			return
-		}
-	}
 	if !client.authenticated.Load() {
 		if cmd.Type == "auth" {
-			if ok, msg := checkAuthRateLimit(client.IP); !ok {
-				log.Printf("Auth rate limited for %s: %s", client.IP, msg)
-				auditLog(client.IP, "AUTH_RATE_LIMITED", msg)
-				_ = client.writeJSON(map[string]interface{}{
-					"type":    "authResponse",
-					"status":  "failed",
-					"message": msg,
-				})
-				return
-			}
-
 			expected := computeMD5(client.Salt + currentPassword())
 			// Constant-time compare so response timing cannot leak how much of
 			// the digest matched.
-			if subtle.ConstantTimeCompare([]byte(cmd.Password), []byte(expected)) == 1 {
+			matched := subtle.ConstantTimeCompare([]byte(cmd.Password), []byte(expected)) == 1
+			// The rate limit gates failures only. Peers behind one IP share a
+			// bucket, so letting a correct digest through means a misbehaving
+			// neighbor cannot lock out a legitimate client; with 128-bit
+			// generated passwords the extra guesses this allows are irrelevant.
+			if !matched {
+				if ok, msg := checkAuthRateLimit(client.IP); !ok {
+					log.Printf("Auth rate limited for %s: %s", client.IP, msg)
+					auditLog(client.IP, "AUTH_RATE_LIMITED", msg)
+					_ = client.writeJSON(map[string]interface{}{
+						"type":    "authResponse",
+						"status":  "failed",
+						"message": msg,
+					})
+					return
+				}
+			}
+			if matched {
 				client.authenticated.Store(true)
+				client.Conn.SetReadLimit(maxMessageSize)
 				client.subMu.Lock()
 				client.Subscriptions = make(map[string]chan bool)
 				client.subMu.Unlock()
@@ -894,6 +1030,23 @@ func handleCommand(client *Client, cmd Command) {
 			log.Println("Client not authenticated. Ignoring command.")
 		}
 		return
+	}
+
+	// Checked only after auth so unauthenticated peers can't probe which
+	// commands are enabled or flood the audit log with BLOCKED entries.
+	if cmd.Type != "auth" && cmd.Type != "unsubscribe" {
+		configMu.RLock()
+		allowed, exists := config.AllowedCommands[cmd.Type]
+		configMu.RUnlock()
+		if !exists || !allowed {
+			log.Printf("Command %s is disabled", cmd.Type)
+			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s is disabled", cmd.Type))
+			_ = client.writeJSON(map[string]interface{}{
+				"type":    "error",
+				"message": "Command " + cmd.Type + " is disabled on the server",
+			})
+			return
+		}
 	}
 
 	switch cmd.Type {
@@ -996,74 +1149,47 @@ func handleCommand(client *Client, cmd Command) {
 		}
 
 	case "keyPress":
-		// First check if the key is allowed
-		if !isKeyAllowed(cmd.Key) {
-			log.Printf("Key %s is not allowed", cmd.Key)
-			auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("keyPress key=%s", cmd.Key))
-			client.writeJSON(map[string]interface{}{
-				"type":    "error",
-				"message": "Key " + cmd.Key + " is not allowed",
-			})
+		if !keysAllowed(client, cmd.Type, cmd.Key, nil) {
 			return
 		}
-
 		auditLog(client.IP, "keyPress", fmt.Sprintf("key=%s", cmd.Key))
-		tapKey(cmd.Key)
+		if err := tapKey(cmd.Key); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Executed key tap: %v", cmd)
 
 	case "keyCombinationPress":
-		// Check if the main key is allowed
-		if !isKeyAllowed(cmd.Key) {
-			log.Printf("Key %s is not allowed", cmd.Key)
-			auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("keyCombinationPress key=%s", cmd.Key))
-			client.writeJSON(map[string]interface{}{
-				"type":    "error",
-				"message": "Key " + cmd.Key + " is not allowed",
-			})
+		if !keysAllowed(client, cmd.Type, cmd.Key, cmd.Modifiers) {
 			return
 		}
-		// Check if all modifiers are allowed
-		for _, modifier := range cmd.Modifiers {
-			if !isKeyAllowed(modifier) {
-				log.Printf("Modifier %s is not allowed", modifier)
-				auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("keyCombinationPress modifier=%s", modifier))
-				client.writeJSON(map[string]interface{}{
-					"type":    "error",
-					"message": "Modifier " + modifier + " is not allowed",
-				})
-				return
-			}
-		}
 		auditLog(client.IP, "keyCombinationPress", fmt.Sprintf("key=%s modifiers=%v", cmd.Key, cmd.Modifiers))
-		tapKey(cmd.Key, cmd.Modifiers...)
+		if err := tapKey(cmd.Key, cmd.Modifiers...); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Executed key tap with modifiers: %s + %v", cmd.Key, cmd.Modifiers)
 
 	case "keyDown":
-		if !isKeyAllowed(cmd.Key) {
-			log.Printf("Key %s is not allowed", cmd.Key)
-			auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("keyDown key=%s", cmd.Key))
-			client.writeJSON(map[string]interface{}{
-				"type":    "error",
-				"message": "Key " + cmd.Key + " is not allowed",
-			})
+		if !keysAllowed(client, cmd.Type, cmd.Key, nil) {
 			return
 		}
 		auditLog(client.IP, "keyDown", fmt.Sprintf("key=%s", cmd.Key))
-		toggleKey(cmd.Key, true)
+		if err := toggleKey(cmd.Key, true); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Key down: %s", cmd.Key)
 
 	case "keyUp":
-		if !isKeyAllowed(cmd.Key) {
-			log.Printf("Key %s is not allowed", cmd.Key)
-			auditLog(client.IP, "KEY_BLOCKED", fmt.Sprintf("keyUp key=%s", cmd.Key))
-			client.writeJSON(map[string]interface{}{
-				"type":    "error",
-				"message": "Key " + cmd.Key + " is not allowed",
-			})
+		if !keysAllowed(client, cmd.Type, cmd.Key, nil) {
 			return
 		}
 		auditLog(client.IP, "keyUp", fmt.Sprintf("key=%s", cmd.Key))
-		toggleKey(cmd.Key, false)
+		if err := toggleKey(cmd.Key, false); err != nil {
+			sendKeyError(client, err)
+			return
+		}
 		log.Printf("Key up: %s", cmd.Key)
 
 	case "osxKeyPressProcess":
@@ -1077,13 +1203,7 @@ func handleCommand(client *Client, cmd Command) {
 				})
 				return
 			}
-			// Check if the main key is allowed
-			if !isKeyAllowed(cmd.Key) {
-				log.Printf("Key %s is not allowed", cmd.Key)
-				client.writeJSON(map[string]interface{}{
-					"type":    "error",
-					"message": "Key " + cmd.Key + " is not allowed",
-				})
+			if !keysAllowed(client, cmd.Type, cmd.Key, cmd.Modifiers) {
 				return
 			}
 			// Validate key contains no AppleScript injection characters
@@ -1095,26 +1215,16 @@ func handleCommand(client *Client, cmd Command) {
 				})
 				return
 			}
-			// Check if all modifiers are allowed
-			for _, modifier := range cmd.Modifiers {
-				if !isKeyAllowed(modifier) {
-					log.Printf("Modifier %s is not allowed", modifier)
-					client.writeJSON(map[string]interface{}{
-						"type":    "error",
-						"message": "Modifier " + modifier + " is not allowed",
-					})
-					return
-				}
+			script, ok := darwinKeyTapScript(cmd.Key, cmd.Modifiers)
+			if !ok {
+				sendKeyError(client, fmt.Errorf("key %s is not supported on macOS", cmd.Key))
+				return
 			}
 			auditLog(client.IP, "osxKeyPressProcess", fmt.Sprintf("process=%s key=%s modifiers=%v", cmd.ProcessName, cmd.Key, cmd.Modifiers))
-			processName, key, mods := cmd.ProcessName, cmd.Key, append([]string(nil), cmd.Modifiers...)
+			processName := cmd.ProcessName
 			go func() {
-				runOsascript(fmt.Sprintf("tell application %q to activate", processName))
-				if script, ok := darwinKeyTapScript(key, mods); ok {
-					runOsascript(script)
-				} else {
-					log.Printf("Unsupported macOS key for osxKeyPressProcess: %q", key)
-				}
+				_ = runOsascript(fmt.Sprintf("tell application %q to activate", processName))
+				_ = runOsascript(script)
 				log.Printf("Sent OSXKeyPressProcess command to %s", processName)
 			}()
 		} else {
@@ -1284,7 +1394,7 @@ func sendSysInfo(client *Client) bool {
 	return true
 }
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
+func wsHandler(w http.ResponseWriter, r *http.Request, gen uint64) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("WebSocket upgrade error:", err)
@@ -1303,8 +1413,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		IP:            remoteIP,
 		Subscriptions: make(map[string]chan bool),
 	}
+	conn.SetReadLimit(maxUnauthMessageSize)
 	registerClient(client)
 	defer unregisterClient(client)
+	// A rebind bumps bindGeneration before disconnectAllClients, and Shutdown
+	// does not close hijacked connections. Checking after registering means a
+	// session upgraded on the old listener is either caught by that disconnect
+	// or sees the newer generation here.
+	if !isCurrentBind(gen) {
+		conn.Close()
+		return
+	}
 
 	auditLog(remoteIP, "CONNECTED", "")
 
@@ -1438,20 +1557,21 @@ func refreshConnectionStatus() {
 		col = theme.ErrorColor()
 	}
 	connectionStatus = status
-	if connectionStatusText != nil {
-		connectionStatusText.Text = status
-		connectionStatusText.Color = col
-		canvas.Refresh(connectionStatusText)
-	}
-	if connectionDetailText != nil {
-		connectionDetailText.Text = detail
-		canvas.Refresh(connectionDetailText)
-	}
-	setStatusCardBg(connectionStatusBg, ok)
-	// Tray menu rebuild takes connMu; run outside this lock.
-	if refreshTrayMenu != nil {
-		go refreshTrayMenu()
-	}
+	uiDo(func() {
+		if connectionStatusText != nil {
+			connectionStatusText.Text = status
+			connectionStatusText.Color = col
+			canvas.Refresh(connectionStatusText)
+		}
+		if connectionDetailText != nil {
+			connectionDetailText.Text = detail
+			canvas.Refresh(connectionDetailText)
+		}
+		setStatusCardBg(connectionStatusBg, ok)
+		if refreshTrayMenu != nil {
+			refreshTrayMenu(status)
+		}
+	})
 }
 
 func setBindResult(addr string, err error) {
@@ -1463,9 +1583,6 @@ func setBindResult(addr string, err error) {
 }
 
 func refreshListenStatusUI() {
-	if listenStatusText == nil {
-		return
-	}
 	bindStatusMu.Lock()
 	err := lastBindError
 	addr := lastBindAddr
@@ -1475,24 +1592,29 @@ func refreshListenStatusUI() {
 		addr = config.Interface + ":" + config.Port
 		configMu.RUnlock()
 	}
-	ok := err == nil
-	if !ok {
-		listenStatusText.Text = "Bind failed"
-		listenStatusText.Color = theme.ErrorColor()
-		if listenDetailText != nil {
-			listenDetailText.Text = err.Error()
-			canvas.Refresh(listenDetailText)
+	uiDo(func() {
+		if listenStatusText == nil {
+			return
 		}
-	} else {
-		listenStatusText.Text = "Listening"
-		listenStatusText.Color = theme.SuccessColor()
-		if listenDetailText != nil {
-			listenDetailText.Text = addr
-			canvas.Refresh(listenDetailText)
+		ok := err == nil
+		if !ok {
+			listenStatusText.Text = "Bind failed"
+			listenStatusText.Color = theme.ErrorColor()
+			if listenDetailText != nil {
+				listenDetailText.Text = err.Error()
+				canvas.Refresh(listenDetailText)
+			}
+		} else {
+			listenStatusText.Text = "Listening"
+			listenStatusText.Color = theme.SuccessColor()
+			if listenDetailText != nil {
+				listenDetailText.Text = addr
+				canvas.Refresh(listenDetailText)
+			}
 		}
-	}
-	canvas.Refresh(listenStatusText)
-	setStatusCardBg(listenStatusBg, ok)
+		canvas.Refresh(listenStatusText)
+		setStatusCardBg(listenStatusBg, ok)
+	})
 }
 
 func preferredLocalIP() string {
@@ -1541,7 +1663,7 @@ func websocketTargetHost() string {
 func flashButtonText(btn *widget.Button, temp, original string) {
 	btn.SetText(temp)
 	time.AfterFunc(1500*time.Millisecond, func() {
-		btn.SetText(original)
+		fyne.Do(func() { btn.SetText(original) })
 	})
 }
 
@@ -1551,7 +1673,7 @@ func flashLabelText(lbl *widget.Label, temp, original string) {
 	}
 	lbl.SetText(temp)
 	time.AfterFunc(1500*time.Millisecond, func() {
-		lbl.SetText(original)
+		fyne.Do(func() { lbl.SetText(original) })
 	})
 }
 
@@ -1596,6 +1718,12 @@ var (
 	currentServer  *http.Server
 	bindGeneration uint64 // bumps on each bind attempt; stale attempts must not win
 )
+
+func isCurrentBind(gen uint64) bool {
+	serverMu.Lock()
+	defer serverMu.Unlock()
+	return gen == bindGeneration
+}
 
 // startHTTPServer binds synchronously (used at process start before the GUI runs).
 func startHTTPServer(bindIP, port string, errorCallback func(err error)) {
@@ -1646,7 +1774,9 @@ func bindHTTPServer(bindIP, port string) (applied bool, err error) {
 
 	addr := bindIP + ":" + port
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler)
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		wsHandler(w, r, gen)
+	})
 	ln, listenErr := net.Listen("tcp", addr)
 
 	serverMu.Lock()
@@ -1833,7 +1963,7 @@ var keyCategories = map[string][]string{
 	"Navigation": {"up", "down", "left", "right", "home", "end", "pageup", "pagedown", "tab", "backspace", "delete", "insert"},
 	"Function":   {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"},
 	"Media":      {"play", "pause", "stop", "next", "previous", "volumeup", "volumedown", "mute"},
-	"System":     {"esc", "enter", "space", "print", "scroll", "pause", "break"},
+	"System":     {"esc", "enter", "space", "print", "scroll", "break"},
 	"Modifiers":  {"ctrl", "alt", "shift", "command", "win"},
 	"Numbers":    {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"},
 	"Letters":    {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"},
@@ -1860,7 +1990,7 @@ var keyDisplayNames = map[string]string{
 	"print":      "Print Screen",
 	"scroll":     "Scroll Lock",
 	"pause":      "Pause",
-	"break":      "Break",
+	"break":      "Pause/Break",
 	"play":       "Play",
 	"stop":       "Stop",
 	"next":       "Next Track",
@@ -1904,6 +2034,12 @@ func normalizeKeyAlias(key string) string {
 		return "enter"
 	case "escape":
 		return "esc"
+	case "pausebreak", "pause_break":
+		return "break"
+	case "printscreen":
+		return "print"
+	case "scrolllock", "scroll_lock":
+		return "scroll"
 	default:
 		return key
 	}
@@ -2149,12 +2285,13 @@ func showActivityLogDialog(parent fyne.Window) {
 			return container.NewBorder(nil, nil, stamp, nil, msg)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
+			row := lines[i]
 			objs := o.(*fyne.Container).Objects
 			msg := objs[0].(*widget.Label)
 			stamp := objs[1].(*widget.RichText)
-			stamp.Segments[0].(*widget.TextSegment).Text = lines[i].stamp
+			stamp.Segments[0].(*widget.TextSegment).Text = row.stamp
 			stamp.Refresh()
-			msg.SetText(lines[i].message)
+			msg.SetText(row.message)
 		},
 	)
 	var copyHint *widget.Label
@@ -2201,7 +2338,7 @@ func showActivityLogDialog(parent fyne.Window) {
 		for {
 			select {
 			case <-ticker.C:
-				refreshLog()
+				fyne.Do(refreshLog)
 			case <-done:
 				return
 			}
@@ -2249,6 +2386,7 @@ func showActivityLogDialog(parent fyne.Window) {
 
 func startGUI() {
 	myApp := app.New()
+	guiStarted.Store(true)
 	appIcon := fyne.NewStaticResource("icon.png", iconPNG)
 	myApp.SetIcon(appIcon)
 	w := myApp.NewWindow("Bitfocus Listener")
@@ -2268,14 +2406,17 @@ func startGUI() {
 		return nil
 	}
 
+	// Called from restartServer's goroutine.
 	applyBindUI := func(err error) {
-		if err != nil {
-			errorState = err.Error()
-		} else {
-			errorState = ""
-		}
-		refreshListenStatusUI()
-		portEntry.Validate()
+		fyne.Do(func() {
+			if err != nil {
+				errorState = err.Error()
+			} else {
+				errorState = ""
+			}
+			refreshListenStatusUI()
+			portEntry.Validate()
+		})
 	}
 
 	restartWithCurrentBind := func() {
@@ -2315,13 +2456,10 @@ func startGUI() {
 		trayHint.Text = "Quit from the window close button when tray is unavailable."
 	}
 
-	buildTrayMenu := func() {
+	buildTrayMenu := func(status string) {
 		if deskApp == nil {
 			return
 		}
-		connMu.Lock()
-		status := connectionStatus
-		connMu.Unlock()
 		statusItem := fyne.NewMenuItem(status, nil)
 		statusItem.Disabled = true
 		quitItem := fyne.NewMenuItem("Quit", func() { myApp.Quit() })
@@ -2346,7 +2484,10 @@ func startGUI() {
 		))
 	}
 	refreshTrayMenu = buildTrayMenu
-	buildTrayMenu()
+	connMu.Lock()
+	initialStatus := connectionStatus
+	connMu.Unlock()
+	buildTrayMenu(initialStatus)
 
 	w.SetCloseIntercept(func() {
 		if trayEnabled {
@@ -2393,7 +2534,7 @@ func startGUI() {
 		if !guiReady {
 			return
 		}
-		if _, err := strconv.Atoi(newPort); err != nil {
+		if n, err := strconv.Atoi(newPort); err != nil || n < 1 || n > 65535 {
 			return
 		}
 		if portDebounceTimer != nil {

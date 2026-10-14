@@ -6,4 +6,4 @@ __DIRNAME="$(dirname "$(readlink -f "$0")")"
 updateVersionFiles
 
 log "Running the application"
-go run .
+cd "$__DIRNAME/.." && go run .

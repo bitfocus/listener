@@ -22,7 +22,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libgl1-mesa-dev xorg-dev libxkbcommon-dev
+          sudo apt-get install -y build-essential libgl1-mesa-dev xorg-dev libxkbcommon-dev libwayland-dev
 
       - name: Generate version.go
         run: tools/dev-version.sh

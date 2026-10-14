@@ -20,10 +20,11 @@ import (
 
 // trayIconResource returns the menu bar glyph. Fyne only marks a systray icon
 // as a macOS template image when the resource is a *theme.ThemedResource, so
-// wrap the monochrome PNG in one; macOS then tints it for the current menu bar
-// appearance instead of drawing our full-colour app icon.
+// wrap the monochrome glyph in one; macOS then tints it for the current menu bar
+// appearance instead of drawing our full-colour app icon. ThemedResource
+// recolours its content as SVG, so the glyph must be SVG rather than PNG.
 func trayIconResource(fyne.Resource) fyne.Resource {
-	return theme.NewThemedResource(fyne.NewStaticResource("tray_icon.png", trayIconPNG))
+	return theme.NewThemedResource(fyne.NewStaticResource("tray_icon.svg", trayIconSVG))
 }
 
 // hideDockIcon runs the app as an accessory (menu-bar) process so it does not
