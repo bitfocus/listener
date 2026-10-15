@@ -2196,8 +2196,10 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 	views := make(map[string]*categoryView)
 	// Showing or hiding rows doesn't re-lay out the scroll content by itself.
 	var relayout func()
-	setExpanded := func(v *categoryView, open bool) {
-		v.expanded = open
+	// showKeys only changes what is drawn; setExpanded also records the
+	// user's choice, which a search temporarily overrides and clearing it
+	// restores.
+	showKeys := func(v *categoryView, open bool) {
 		if open {
 			v.toggle.SetIcon(theme.MenuDropDownIcon())
 			v.keys.Show()
@@ -2205,6 +2207,10 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			v.toggle.SetIcon(theme.MenuExpandIcon())
 			v.keys.Hide()
 		}
+	}
+	setExpanded := func(v *categoryView, open bool) {
+		v.expanded = open
+		showKeys(v, open)
 	}
 	applyCategoryLock := func(cat string) {
 		whole := categoryCheckboxes[cat].Checked
@@ -2252,7 +2258,7 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 		// actions can't be confused.
 		count := newSubtleText(fmt.Sprintf("%d keys", len(keys)))
 		v.toggle = newTapRow(cat, container.NewCenter(count), theme.MenuExpandIcon(), func() {
-			setExpanded(v, !v.expanded)
+			setExpanded(v, !v.keys.Visible())
 			relayout()
 		})
 		header := container.NewBorder(nil, nil, nil, catCheck, v.toggle)
@@ -2295,10 +2301,10 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			}
 			if filter == "" {
 				v.row.Show()
-				setExpanded(v, false)
+				showKeys(v, v.expanded)
 			} else if matches > 0 || strings.Contains(strings.ToLower(cat), filter) {
 				v.row.Show()
-				setExpanded(v, matches > 0)
+				showKeys(v, matches > 0)
 			} else {
 				v.row.Hide()
 			}
@@ -2368,6 +2374,8 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			}
 			config.KeyCategories[category] = cb.Checked
 		}
+		// Only allowed keys are stored; a missing key reads as not allowed, so
+		// the config doesn't fill with a false entry for every known key.
 		for key, on := range keyAllowed {
 			if config.AllowedKeys[key] != on {
 				action := "disabled"
@@ -2376,7 +2384,11 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 				}
 				changes = append(changes, fmt.Sprintf("key:%s=%s", getKeyDisplayName(key), action))
 			}
-			config.AllowedKeys[key] = on
+			if on {
+				config.AllowedKeys[key] = true
+			} else {
+				delete(config.AllowedKeys, key)
+			}
 		}
 		err := saveConfigLocked(&config)
 		configMu.Unlock()
@@ -2396,6 +2408,14 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 		sheetButton{label: "Cancel"},
 		sheetButton{label: "Save", importance: widget.HighImportance, onTap: save},
 	)
+	// Escape in the search field clears it first, then closes the sheet.
+	searchEntry.OnEscape = func() {
+		if searchEntry.Text != "" {
+			searchEntry.SetText("")
+		} else {
+			d.Hide()
+		}
+	}
 	d.Resize(fyne.NewSize(600, 640))
 	d.Show()
 }
@@ -2690,18 +2710,23 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		if !ok {
 			return
 		}
-		applyPortBtn.Hide()
 		configMu.Lock()
 		if config.Port == newPort {
 			configMu.Unlock()
+			applyPortBtn.Hide()
 			return
 		}
+		// Roll back on a failed save so config keeps matching the running
+		// server and Apply stays available to retry.
+		oldPort := config.Port
 		config.Port = newPort
 		if err := saveConfigLocked(&config); err != nil {
+			config.Port = oldPort
 			configMu.Unlock()
 			dialog.ShowError(err, w)
 			return
 		}
+		applyPortBtn.Hide()
 		iface, port := config.Interface, config.Port
 		configMu.Unlock()
 		portEntry.SetText(newPort)
@@ -2938,16 +2963,20 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 
 	body := container.New(layout.NewCustomPaddedLayout(0, 0, margin, margin), page)
 	scroll := container.NewVScroll(body)
-	scroll.OnScrolled = func(offset fyne.Position) {
-		if offset.Y > 0 {
+	syncDivider := func() {
+		if scroll.Offset.Y > 0 {
 			divider.Show()
 		} else {
 			divider.Hide()
 		}
 	}
+	scroll.OnScrolled = func(fyne.Position) { syncDivider() }
+	// Growing the window clamps the offset back to 0 without OnScrolled, so
+	// re-check after every layout too.
+	scrollArea := container.New(fillThenLayout{after: syncDivider}, scroll)
 	footer := container.New(layout.NewCustomPaddedLayout(0, margin, margin, margin), footerText)
 	w.SetPadded(false)
-	w.SetContent(container.NewBorder(top, footer, nil, nil, scroll))
+	w.SetContent(container.NewBorder(top, footer, nil, nil, scrollArea))
 	// The scroll has no useful min height, so open tall enough to show every
 	// section; Border adds one padding between each of its regions.
 	openSize = fyne.NewSize(560, top.MinSize().Height+body.MinSize().Height+footer.MinSize().Height+2*theme.Padding())

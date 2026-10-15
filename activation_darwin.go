@@ -62,15 +62,25 @@ void setAccessoryActivationPolicy(void) {
 void unifyTitlebar(uintptr_t ptr, double dragHeight) {
 	NSWindow *win = (NSWindow *)ptr;
 	void (^apply)(void) = ^{
+		NSView *content = win.contentView;
+		// Already applied: don't stack a second toolbar and drag strip.
+		for (NSView *sub in content.subviews) {
+			if ([sub isKindOfClass:[ListenerDragView class]]) {
+				return;
+			}
+		}
+		// cgo builds Objective-C without ARC, so release what we alloc once
+		// its owner has retained it.
 		if (@available(macOS 11.0, *)) {
-			win.toolbar = [[NSToolbar alloc] initWithIdentifier:@"listener.main"];
+			NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"listener.main"];
+			win.toolbar = toolbar;
+			[toolbar release];
 			win.toolbarStyle = NSWindowToolbarStyleUnified;
 		}
 		win.titleVisibility = NSWindowTitleHidden;
 		win.titlebarAppearsTransparent = YES;
 		win.styleMask |= NSWindowStyleMaskFullSizeContentView;
 
-		NSView *content = win.contentView;
 		NSRect bounds = content.bounds;
 		CGFloat y = content.isFlipped ? 0 : bounds.size.height - dragHeight;
 		ListenerDragView *drag = [[ListenerDragView alloc]
@@ -78,6 +88,7 @@ void unifyTitlebar(uintptr_t ptr, double dragHeight) {
 		drag.autoresizingMask = NSViewWidthSizable |
 			(content.isFlipped ? NSViewMaxYMargin : NSViewMinYMargin);
 		[content addSubview:drag];
+		[drag release];
 	};
 	if ([NSThread isMainThread]) {
 		apply();

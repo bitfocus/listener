@@ -36,11 +36,34 @@ var (
 	}
 )
 
+// themedColors are the names listenerTheme replaces; anything else goes
+// straight to the base theme without the background check below.
+var themedColors = map[fyne.ThemeColorName]bool{
+	theme.ColorNamePrimary:             true,
+	theme.ColorNameForegroundOnPrimary: true,
+	theme.ColorNameFocus:               true,
+	theme.ColorNameSelection:           true,
+	theme.ColorNameInputBorder:         true,
+	theme.ColorNamePlaceHolder:         true,
+	theme.ColorNameError:               true,
+	theme.ColorNameSuccess:             true,
+	theme.ColorNameWarning:             true,
+	theme.ColorNameOverlayBackground:   true,
+	theme.ColorNameInputBackground:     true,
+	theme.ColorNameScrollBarBackground: true,
+	theme.ColorNameButton:              true,
+	theme.ColorNameDisabledButton:      true,
+	theme.ColorNameMenuBackground:      true,
+}
+
 type listenerTheme struct{ fyne.Theme }
 
 // Color picks light or dark overrides from the actual background rather than
 // the variant argument, so it holds however the variant is reported.
 func (t listenerTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if !themedColors[n] {
+		return t.Theme.Color(n, v)
+	}
 	bg := t.Theme.Color(theme.ColorNameBackground, v)
 	dark := isDark(bg)
 	accent, overrides := accentLight, lightContrast
@@ -269,6 +292,9 @@ type tapRow struct {
 	onTap   func()
 	hovered bool
 	focused bool
+	// ring is whether the focus ring shows: only for keyboard focus, not the
+	// focus Fyne gives a Focusable widget on mouse-down.
+	ring bool
 }
 
 var (
@@ -306,7 +332,21 @@ func (r *tapRow) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(container.NewStack(r.bg, r.content))
 }
 
+// Tapped handles a mouse click. It drops the hover state (a sheet opened
+// over the row would swallow MouseOut) and releases the focus that the click
+// gave the row, so no ring lingers and no sheet restores focus here.
 func (r *tapRow) Tapped(*fyne.PointEvent) {
+	r.hovered = false
+	if r.focused {
+		if c := fyne.CurrentApp().Driver().CanvasForObject(r); c != nil {
+			c.Unfocus()
+		}
+	}
+	r.Refresh()
+	r.activate()
+}
+
+func (r *tapRow) activate() {
 	if r.onTap != nil {
 		r.onTap()
 	}
@@ -318,23 +358,25 @@ func (r *tapRow) Cursor() desktop.Cursor { return desktop.PointerCursor }
 
 func (r *tapRow) FocusGained() {
 	r.focused = true
+	r.ring = !r.hovered
 	r.Refresh()
 }
 
 func (r *tapRow) FocusLost() {
 	r.focused = false
+	r.ring = false
 	r.Refresh()
 }
 
 func (r *tapRow) TypedRune(rn rune) {
 	if rn == ' ' {
-		r.Tapped(nil)
+		r.activate()
 	}
 }
 
 func (r *tapRow) TypedKey(ev *fyne.KeyEvent) {
 	if ev.Name == fyne.KeyReturn || ev.Name == fyne.KeyEnter {
-		r.Tapped(nil)
+		r.activate()
 	}
 }
 
@@ -343,7 +385,13 @@ func (r *tapRow) MouseIn(*desktop.MouseEvent) {
 	r.Refresh()
 }
 
-func (r *tapRow) MouseMoved(*desktop.MouseEvent) {}
+// MouseMoved restores the hover cleared by Tapped once the pointer moves again.
+func (r *tapRow) MouseMoved(*desktop.MouseEvent) {
+	if !r.hovered {
+		r.hovered = true
+		r.Refresh()
+	}
+}
 
 func (r *tapRow) MouseOut() {
 	r.hovered = false
@@ -356,7 +404,7 @@ func (r *tapRow) Refresh() {
 	} else {
 		r.bg.FillColor = color.Transparent
 	}
-	if r.focused {
+	if r.focused && r.ring {
 		r.bg.StrokeColor = theme.Color(theme.ColorNameFocus)
 	} else {
 		r.bg.StrokeColor = color.Transparent
@@ -409,26 +457,43 @@ type sheet struct {
 	onClosed  func()
 	primary   func()
 	prevOnKey func(*fyne.KeyEvent)
+	prevFocus fyne.Focusable
 }
 
 // sheetMargin keeps sheets clear of the window edges.
 const sheetMargin = 16
 
 // Show opens the sheet with Escape bound to cancel and Return to the primary
-// button. Fyne sends keys to the focused widget first, so focus is cleared
-// to let these reach the canvas until the user tabs into the sheet.
+// button, and remembers the focused widget so Hide can return focus to it.
+//
+// Keys go through the desktop canvas's key-down hook, which Fyne calls even
+// while a checkbox or button inside the sheet has focus (only text entries
+// swallow it; see escapeEntry). Canvases without that hook fall back to
+// OnTypedKey, which only fires when nothing is focused.
 func (s *sheet) Show() {
-	s.prevOnKey = s.canvas.OnTypedKey()
-	s.canvas.SetOnTypedKey(func(ev *fyne.KeyEvent) {
+	s.prevFocus = s.canvas.Focused()
+	handle := func(ev *fyne.KeyEvent) {
 		switch ev.Name {
 		case fyne.KeyEscape:
 			s.Hide()
 		case fyne.KeyReturn, fyne.KeyEnter:
-			if s.primary != nil {
-				s.primary()
+			// A focused button or row handles Return itself; only fire the
+			// primary action when focus is nowhere or on a checkbox.
+			switch s.canvas.Focused().(type) {
+			case nil, *widget.Check:
+				if s.primary != nil {
+					s.primary()
+				}
 			}
 		}
-	})
+	}
+	if dc, ok := s.canvas.(desktop.Canvas); ok {
+		s.prevOnKey = dc.OnKeyDown()
+		dc.SetOnKeyDown(handle)
+	} else {
+		s.prevOnKey = s.canvas.OnTypedKey()
+		s.canvas.SetOnTypedKey(handle)
+	}
 	s.canvas.Unfocus()
 	s.pop.Show()
 }
@@ -450,8 +515,18 @@ func (s *sheet) Resize(size fyne.Size) {
 }
 
 func (s *sheet) Hide() {
-	s.canvas.SetOnTypedKey(s.prevOnKey)
+	if !s.pop.Visible() {
+		return
+	}
+	if dc, ok := s.canvas.(desktop.Canvas); ok {
+		dc.SetOnKeyDown(s.prevOnKey)
+	} else {
+		s.canvas.SetOnTypedKey(s.prevOnKey)
+	}
 	s.pop.Hide()
+	if s.prevFocus != nil {
+		s.canvas.Focus(s.prevFocus)
+	}
 	if s.onClosed != nil {
 		s.onClosed()
 	}
@@ -499,9 +574,25 @@ func newSheet(parent fyne.Window, title, message string, content fyne.CanvasObje
 	return s
 }
 
+// escapeEntry is an Entry that reports Escape. Entries swallow key-down
+// events, so a sheet's own Escape handling can't see them.
+type escapeEntry struct {
+	widget.Entry
+	OnEscape func()
+}
+
+func (e *escapeEntry) TypedKey(ev *fyne.KeyEvent) {
+	if ev.Name == fyne.KeyEscape && e.OnEscape != nil {
+		e.OnEscape()
+		return
+	}
+	e.Entry.TypedKey(ev)
+}
+
 // newSearchEntry is an Entry with a search icon inset from its right edge.
-func newSearchEntry(placeholder string) *widget.Entry {
-	e := widget.NewEntry()
+func newSearchEntry(placeholder string) *escapeEntry {
+	e := &escapeEntry{}
+	e.ExtendBaseWidget(e)
 	e.SetPlaceHolder(placeholder)
 	e.ActionItem = container.New(layout.NewCustomPaddedLayout(0, 0, 0, theme.Padding()), widget.NewIcon(theme.SearchIcon()))
 	return e
@@ -575,4 +666,16 @@ func (e *digitEntry) FocusLost() {
 	if e.OnFocusLost != nil {
 		e.OnFocusLost()
 	}
+}
+
+// fillThenLayout sizes a single object to fill its container, then calls
+// after. It lets callers react to resizes that fire no callback of their own.
+type fillThenLayout struct{ after func() }
+
+func (l fillThenLayout) MinSize(objs []fyne.CanvasObject) fyne.Size { return objs[0].MinSize() }
+
+func (l fillThenLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	objs[0].Move(fyne.NewPos(0, 0))
+	objs[0].Resize(size)
+	l.after()
 }
