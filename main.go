@@ -698,7 +698,14 @@ var darwinKeyCodes = map[string]int{
 	"f9": 101, "f10": 109, "f11": 103, "f12": 111,
 	"home": 115, "end": 119, "pageup": 116, "pagedown": 121,
 	"forwarddelete": 117, "fwd_delete": 117,
-	"f13": 105, "f14": 107, "f15": 113,
+	"f13": 105, "f14": 107, "f15": 113, "f16": 106,
+	"f17": 64, "f18": 79, "f19": 80, "f20": 90,
+	"num0": 82, "num1": 83, "num2": 84, "num3": 85, "num4": 86,
+	"num5": 87, "num6": 88, "num7": 89, "num8": 91, "num9": 92,
+	"num.": 65, "num+": 69, "num-": 78, "num*": 67, "num/": 75,
+	"num_enter": 76, "num_equal": 81,
+	// Mac keypads have Clear where PC keypads have Num Lock.
+	"num_lock": 71,
 	// Apple extended keyboards put Print Screen / Scroll Lock / Pause on
 	// F13-F15 and Insert on Help.
 	"print": 105, "printscreen": 105,
@@ -724,6 +731,12 @@ var robotgoKeyAliases = map[string]string{
 	"command": "cmd",
 	"option":  "alt",
 	"control": "ctrl",
+	// Listener's key names that robotgo spells differently.
+	"return":     "enter",
+	"scroll":     "scroll_lock",
+	"scrolllock": "scroll_lock",
+	"break":      "pause_break",
+	"pausebreak": "pause_break",
 }
 
 // NX_KEYTYPE_* values from IOKit/hidsystem/ev_keymap.h
@@ -1961,9 +1974,10 @@ func showAllowedCommandsDialog(parent fyne.Window, updateStatusCallback func()) 
 // Key categories for easier selection
 var keyCategories = map[string][]string{
 	"Navigation": {"up", "down", "left", "right", "home", "end", "pageup", "pagedown", "tab", "backspace", "delete", "insert"},
-	"Function":   {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"},
+	"Function":   {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24"},
 	"Media":      {"play", "pause", "stop", "next", "previous", "volumeup", "volumedown", "mute"},
-	"System":     {"esc", "enter", "space", "print", "scroll", "break"},
+	"System":     {"esc", "enter", "space", "capslock", "menu", "print", "scroll", "break"},
+	"Numpad":     {"num0", "num1", "num2", "num3", "num4", "num5", "num6", "num7", "num8", "num9", "num.", "num+", "num-", "num*", "num/", "num_enter", "num_equal", "num_lock"},
 	"Modifiers":  {"ctrl", "alt", "shift", "command", "win"},
 	"Numbers":    {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"},
 	"Letters":    {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"},
@@ -1987,6 +2001,8 @@ var keyDisplayNames = map[string]string{
 	"esc":        "Escape",
 	"enter":      "Enter",
 	"space":      "Space",
+	"capslock":   "Caps Lock",
+	"menu":       "Menu / Context",
 	"print":      "Print Screen",
 	"scroll":     "Scroll Lock",
 	"pause":      "Pause",
@@ -2003,6 +2019,24 @@ var keyDisplayNames = map[string]string{
 	"shift":      "Shift",
 	"command":    "Cmd (Mac)",
 	"win":        "Windows",
+	"num0":       "Numpad 0",
+	"num1":       "Numpad 1",
+	"num2":       "Numpad 2",
+	"num3":       "Numpad 3",
+	"num4":       "Numpad 4",
+	"num5":       "Numpad 5",
+	"num6":       "Numpad 6",
+	"num7":       "Numpad 7",
+	"num8":       "Numpad 8",
+	"num9":       "Numpad 9",
+	"num.":       "Numpad .",
+	"num+":       "Numpad +",
+	"num-":       "Numpad -",
+	"num*":       "Numpad *",
+	"num/":       "Numpad /",
+	"num_enter":  "Numpad Enter",
+	"num_equal":  "Numpad =",
+	"num_lock":   "Num Lock",
 }
 
 // Get display name for a key
@@ -2040,6 +2074,8 @@ func normalizeKeyAlias(key string) string {
 		return "print"
 	case "scrolllock", "scroll_lock":
 		return "scroll"
+	case "caps_lock":
+		return "capslock"
 	default:
 		return key
 	}

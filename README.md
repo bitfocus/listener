@@ -108,8 +108,9 @@ configuration:
 | --- | --- |
 | Letters / digits | `a`–`z`, `0`–`9` |
 | Navigation | `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `tab`, `backspace`, `delete`, `insert` |
-| Function | `f1`–`f12` |
-| System | `esc` / `escape`, `enter` / `return`, `space` |
+| Function | `f1`–`f24` (`f21`–`f24` on Windows/Linux only) |
+| System | `esc` / `escape`, `enter` / `return`, `space`, `capslock`, `menu` (Windows/Linux only), `print`, `scroll`, `break` |
+| Numpad | `num0`–`num9`, `num.`, `num+`, `num-`, `num*`, `num/`, `num_enter`, `num_equal`, `num_lock` (Clear on macOS) |
 | Modifiers | `ctrl` / `control`, `alt` / `option`, `shift`, `cmd` / `command` / `win` / `meta` |
 | Media | `volumeup`, `volumedown`, `mute`, `play`, `pause`, `next`, `previous` (`stop` on Windows/Linux only) |
 
