@@ -1477,8 +1477,35 @@ func handleCommand(client *Client, cmd Command) {
 // sendSysInfo pushes one metrics update. Returns false only when the WebSocket
 // write fails (caller should end the subscription). Metric collection errors
 // are logged and the subscription continues.
+// sysInfoMaxAge is just under the 5s subscription tick, so subscribers share
+// one sample per tick instead of each enumerating processes.
+const sysInfoMaxAge = 4 * time.Second
+
+var (
+	sysInfoMu   sync.Mutex
+	sysInfoLast SysInfo
+	sysInfoAt   time.Time
+)
+
+// sharedSystemInfo samples at most once per sysInfoMaxAge. It also keeps
+// gopsutil's cpu.Percent(0, …) meaningful: that measures since the previous
+// call process-wide, so interleaved per-client calls would shrink the window.
+func sharedSystemInfo() (SysInfo, error) {
+	sysInfoMu.Lock()
+	defer sysInfoMu.Unlock()
+	if !sysInfoAt.IsZero() && time.Since(sysInfoAt) < sysInfoMaxAge {
+		return sysInfoLast, nil
+	}
+	info, err := getSystemInfo()
+	if err != nil {
+		return info, err
+	}
+	sysInfoLast, sysInfoAt = info, time.Now()
+	return info, nil
+}
+
 func sendSysInfo(client *Client) bool {
-	sysInfo, err := getSystemInfo()
+	sysInfo, err := sharedSystemInfo()
 	if err != nil {
 		log.Printf("Error getting system info: %v", err)
 		return true
