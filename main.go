@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
@@ -263,10 +265,54 @@ type AuditEntry struct {
 	IP     string
 	Action string
 	Detail string
+	// Repeats counts identical entries folded into this one; see AuditLogger.Log.
+	Repeats int
+	Last    time.Time
 }
 
 func (e AuditEntry) String() string {
-	return fmt.Sprintf("%s [%s] %s %s", e.Time.Format("2006-01-02 15:04:05"), e.IP, e.Action, e.Detail)
+	line := fmt.Sprintf("%s [%s] %s %s", e.Time.Format(time.RFC3339), e.IP, e.Action, e.Detail)
+	if e.Repeats > 0 {
+		line += fmt.Sprintf(" (×%d)", e.Repeats+1)
+	}
+	return line
+}
+
+// auditRepeatWindow is how close together identical entries must be to fold
+// into one line, so a button streaming commands doesn't flush the log.
+const auditRepeatWindow = 10 * time.Second
+
+// sameAuditEvent reports whether next repeats prev. mousePositionSet folds even
+// when the coordinates differ, as mouse moves arrive as a stream.
+func sameAuditEvent(prev, next AuditEntry) bool {
+	if prev.IP != next.IP || prev.Action != next.Action || next.Time.Sub(prev.Last) > auditRepeatWindow {
+		return false
+	}
+	return prev.Detail == next.Detail || next.Action == "mousePositionSet"
+}
+
+// sanitizeLogField escapes control characters so client-supplied text cannot
+// forge extra lines or terminal sequences in the log file.
+func sanitizeLogField(s string) string {
+	if !strings.ContainsFunc(s, unicode.IsControl) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case unicode.IsControl(r):
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // AuditLogger holds an in-memory ring buffer and writes to a log file.
@@ -324,9 +370,11 @@ func (a *AuditLogger) rotateIfNeeded() {
 	// nosec
 	f, err := os.OpenFile(a.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
+		// Put the file back and keep appending to it; the next write retries.
 		log.Printf("Failed to rotate audit log: %v", err)
-		a.file = nil
-		old.Close()
+		if err := os.Rename(oldPath, a.filePath); err != nil {
+			log.Printf("Failed to restore audit log after rotation error: %v", err)
+		}
 		return
 	}
 	a.file = f
@@ -335,15 +383,33 @@ func (a *AuditLogger) rotateIfNeeded() {
 }
 
 func (a *AuditLogger) Log(ip, action, detail string) {
+	now := time.Now()
 	entry := AuditEntry{
-		Time:   time.Now(),
-		IP:     ip,
-		Action: action,
-		Detail: detail,
+		Time:   now,
+		Last:   now,
+		IP:     sanitizeLogField(ip),
+		Action: sanitizeLogField(action),
+		Detail: sanitizeLogField(detail),
 	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.count > 0 {
+		last := &a.entries[(a.start+a.count-1)%auditRingSize]
+		if sameAuditEvent(*last, entry) {
+			last.Repeats++
+			last.Last = now
+			last.Detail = entry.Detail
+			a.seq++
+			return
+		}
+		// The file is append-only, so a folded run is summarised once it ends.
+		if last.Repeats > 0 {
+			a.writeLine(fmt.Sprintf("%s [%s] %s repeated %d more times, last %s",
+				last.Last.Format(time.RFC3339), last.IP, last.Action, last.Repeats, last.Detail))
+		}
+	}
 
 	if a.count < auditRingSize {
 		a.entries[(a.start+a.count)%auditRingSize] = entry
@@ -354,18 +420,21 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 	}
 	a.seq++
 
-	// Write to file
+	a.writeLine(entry.String())
+}
+
+// writeLine appends one line to the log file. Caller must hold a.mu.
+func (a *AuditLogger) writeLine(line string) {
 	if a.file == nil {
 		return
 	}
-	line := entry.String() + "\n"
-	n, err := a.file.WriteString(line)
+	n, err := a.file.WriteString(line + "\n")
 	if err != nil {
 		log.Printf("Failed to write audit log: %v", err)
-	} else {
-		a.fileSize += int64(n)
-		a.rotateIfNeeded()
+		return
 	}
+	a.fileSize += int64(n)
+	a.rotateIfNeeded()
 }
 
 // Snapshot returns a copy of the ring buffer contents along with the total
@@ -391,11 +460,16 @@ func auditLog(ip, action, detail string) {
 
 // truncateForLog limits a string for safe log output.
 func truncateForLog(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+	s = sanitizeLogField(s)
+	if len(s) <= maxLen {
+		return s
 	}
-	return s
+	// Cut on a rune boundary so the log stays valid UTF-8.
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 // sanitizeOpenTarget validates a user-supplied target for the fileOpen command.
@@ -653,7 +727,9 @@ func logCommand(cmd Command) {
 		log.Printf("Received command: type=auth")
 	case "shellRun":
 		log.Printf("Received command: type=shellRun shell=%q", truncateForLog(cmd.Shell, 80))
-	case "osxAppleScript", "keyString":
+	case "keyString":
+		log.Printf("Received command: type=keyString chars=%d", utf8.RuneCountInString(cmd.Msg))
+	case "osxAppleScript":
 		log.Printf("Received command: type=%s msg=%q", cmd.Type, truncateForLog(cmd.Msg, 80))
 	default:
 		log.Printf("Received command: type=%s key=%q name=%q", cmd.Type, cmd.Key, cmd.Name)
@@ -1293,10 +1369,11 @@ func handleCommand(client *Client, cmd Command) {
 				return
 			}
 		}
-		auditLog(client.IP, "keyString", truncateForLog(cmd.Msg, 100))
+		// Typed text is often a password, so only its length is ever logged.
+		chars := utf8.RuneCountInString(cmd.Msg)
+		auditLog(client.IP, "keyString", fmt.Sprintf("chars=%d", chars))
 		typeString(cmd.Msg)
-		// Typed text can contain credentials; keep stdout as terse as the audit log.
-		log.Printf("Typed string: %s", truncateForLog(cmd.Msg, 100))
+		log.Printf("Typed string: %d chars", chars)
 
 	case "shellRun":
 		// shellRun intentionally executes arbitrary operator-supplied shell commands;
@@ -1372,8 +1449,8 @@ func handleCommand(client *Client, cmd Command) {
 		}
 
 	case "mousePositionGet":
+		// Read-only and usually polled, so not audited.
 		x, y := getMousePos()
-		auditLog(client.IP, "mousePositionGet", fmt.Sprintf("x=%d y=%d", x, y))
 		response := map[string]interface{}{
 			"type": "mousePositionGetResponse",
 			"x":    x,
@@ -1650,6 +1727,28 @@ func websocketTargetHost() string {
 		return "127.0.0.1"
 	}
 	return iface
+}
+
+// revealInFileManager shows path selected in Finder / Explorer, or opens its
+// folder elsewhere.
+func revealInFileManager(path string) {
+	if path == "" {
+		return
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", "-R", path)
+	case "windows":
+		cmd = exec.Command("explorer", "/select,"+path)
+	default:
+		cmd = exec.Command("xdg-open", filepath.Dir(path))
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("Failed to reveal %s: %v", path, err)
+		return
+	}
+	go func() { _ = cmd.Wait() }()
 }
 
 func openAccessibilitySettings() {
@@ -2512,6 +2611,9 @@ func showActivityLogDialog(parent fyne.Window) {
 			if e.Detail != "" {
 				detail = "  " + e.Detail
 			}
+			if e.Repeats > 0 {
+				detail += fmt.Sprintf("  ×%d", e.Repeats+1)
+			}
 			next = append(next, logRow{
 				meta:   e.Time.Format("Jan 2, 15:04:05") + "  ·  " + source,
 				action: e.Action,
@@ -2549,6 +2651,7 @@ func showActivityLogDialog(parent fyne.Window) {
 		logFilePath = audit.filePath
 	}
 	copyPathBtn := newCopyButton(parent.Clipboard(), func() string { return logFilePath })
+	revealBtn := newIconButton(theme.FolderOpenIcon(), func() { revealInFileManager(logFilePath) })
 	pathText := newSubtleText(logFilePath)
 	subtleStyle(pathText).TextStyle = fyne.TextStyle{Monospace: true}
 	subtleStyle(pathText).Inline = false
@@ -2556,7 +2659,7 @@ func showActivityLogDialog(parent fyne.Window) {
 
 	content := container.NewBorder(
 		copyHint,
-		container.NewBorder(nil, nil, nil, copyPathBtn, pathText),
+		container.NewBorder(nil, nil, nil, container.NewHBox(revealBtn, copyPathBtn), pathText),
 		nil, nil,
 		newCard(container.NewThemeOverride(logList, compactTheme{fyne.CurrentApp().Settings().Theme()})),
 	)
