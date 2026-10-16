@@ -36,65 +36,53 @@ var (
 	}
 )
 
-// themedColors are the names listenerTheme replaces; anything else goes
-// straight to the base theme without the background check below.
-var themedColors = map[fyne.ThemeColorName]bool{
-	theme.ColorNamePrimary:             true,
-	theme.ColorNameForegroundOnPrimary: true,
-	theme.ColorNameFocus:               true,
-	theme.ColorNameSelection:           true,
-	theme.ColorNameInputBorder:         true,
-	theme.ColorNamePlaceHolder:         true,
-	theme.ColorNameError:               true,
-	theme.ColorNameSuccess:             true,
-	theme.ColorNameWarning:             true,
-	theme.ColorNameOverlayBackground:   true,
-	theme.ColorNameInputBackground:     true,
-	theme.ColorNameScrollBarBackground: true,
-	theme.ColorNameButton:              true,
-	theme.ColorNameDisabledButton:      true,
-	theme.ColorNameMenuBackground:      true,
+// listenerTheme is the default theme with our accent, contrast fixes and
+// neutral dark surfaces. The replaced colours are computed once per variant.
+type listenerTheme struct {
+	fyne.Theme
+	colors map[fyne.ThemeVariant]map[fyne.ThemeColorName]color.Color
 }
 
-type listenerTheme struct{ fyne.Theme }
+func newListenerTheme() listenerTheme {
+	base := theme.DefaultTheme()
+	return listenerTheme{Theme: base, colors: map[fyne.ThemeVariant]map[fyne.ThemeColorName]color.Color{
+		theme.VariantDark:  themeColors(base, theme.VariantDark),
+		theme.VariantLight: themeColors(base, theme.VariantLight),
+	}}
+}
 
-// Color picks light or dark overrides from the actual background rather than
-// the variant argument, so it holds however the variant is reported.
-func (t listenerTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
-	if !themedColors[n] {
-		return t.Theme.Color(n, v)
+func themeColors(base fyne.Theme, v fyne.ThemeVariant) map[fyne.ThemeColorName]color.Color {
+	accent, contrast := accentLight, lightContrast
+	if v == theme.VariantDark {
+		accent, contrast = accentDark, darkContrast
 	}
-	bg := t.Theme.Color(theme.ColorNameBackground, v)
-	dark := isDark(bg)
-	accent, overrides := accentLight, lightContrast
-	if dark {
-		accent, overrides = accentDark, darkContrast
+	colors := map[fyne.ThemeColorName]color.Color{
+		theme.ColorNamePrimary:             accent,
+		theme.ColorNameForegroundOnPrimary: color.NRGBA{R: 0x1C, G: 0x1B, B: 0x1A, A: 0xFF},
+		theme.ColorNameFocus:               withAlpha(accent, 0x7F),
+		theme.ColorNameSelection:           withAlpha(accent, 0x3F),
 	}
-	switch n {
-	case theme.ColorNamePrimary:
-		return accent
-	case theme.ColorNameForegroundOnPrimary:
-		return color.NRGBA{R: 0x1C, G: 0x1B, B: 0x1A, A: 0xFF}
-	case theme.ColorNameFocus:
-		return withAlpha(accent, 0x7F)
-	case theme.ColorNameSelection:
-		return withAlpha(accent, 0x3F)
-	}
-	if c, ok := overrides[n]; ok {
-		return c
+	for n, c := range contrast {
+		colors[n] = c
 	}
 	// Fyne's dark surfaces are tinted navy; derive them from the neutral window
 	// background instead so popups and controls match the main screen.
-	if dark {
-		fg := t.Theme.Color(theme.ColorNameForeground, v)
-		switch n {
-		case theme.ColorNameOverlayBackground:
-			return mix(bg, fg, 0.05)
-		case theme.ColorNameInputBackground, theme.ColorNameScrollBarBackground:
-			return mix(bg, fg, 0.06)
-		case theme.ColorNameButton, theme.ColorNameDisabledButton, theme.ColorNameMenuBackground:
-			return mix(bg, fg, 0.11)
-		}
+	if v == theme.VariantDark {
+		bg := base.Color(theme.ColorNameBackground, v)
+		fg := base.Color(theme.ColorNameForeground, v)
+		colors[theme.ColorNameOverlayBackground] = mix(bg, fg, 0.05)
+		colors[theme.ColorNameInputBackground] = mix(bg, fg, 0.06)
+		colors[theme.ColorNameScrollBarBackground] = mix(bg, fg, 0.06)
+		colors[theme.ColorNameButton] = mix(bg, fg, 0.11)
+		colors[theme.ColorNameDisabledButton] = mix(bg, fg, 0.11)
+		colors[theme.ColorNameMenuBackground] = mix(bg, fg, 0.11)
+	}
+	return colors
+}
+
+func (t listenerTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if c, ok := t.colors[v][n]; ok {
+		return c
 	}
 	return t.Theme.Color(n, v)
 }
@@ -108,11 +96,6 @@ func (t listenerTheme) Size(n fyne.ThemeSizeName) float32 {
 		return 12
 	}
 	return t.Theme.Size(n)
-}
-
-func isDark(c color.Color) bool {
-	r, g, b, _ := c.RGBA()
-	return (299*r+587*g+114*b)/1000 < 0x8000
 }
 
 // mix blends a toward b by amount (0..1), returning an opaque colour.
@@ -185,10 +168,11 @@ type statusLayout struct{}
 
 const statusDotGap = 6
 
+// The label starts at dot width + gap; its own inner padding then puts the
+// text just right of the dot, which itself sits at the label inset.
 func (statusLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	dot, label := objs[0].MinSize(), objs[1].MinSize()
-	inset := theme.InnerPadding()
-	return fyne.NewSize(inset+dot.Width+statusDotGap-inset+label.Width, fyne.Max(dot.Height, label.Height))
+	return fyne.NewSize(dot.Width+statusDotGap+label.Width, fyne.Max(dot.Height, label.Height))
 }
 
 func (statusLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
@@ -197,7 +181,7 @@ func (statusLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	dotSize := dot.MinSize()
 	labelH := label.MinSize().Height
 	labelY := (size.Height - labelH) / 2
-	labelX := inset + dotSize.Width + statusDotGap - inset
+	labelX := dotSize.Width + statusDotGap
 	label.Resize(fyne.NewSize(size.Width-labelX, labelH))
 	label.Move(fyne.NewPos(labelX, labelY))
 	dot.Resize(dotSize)
@@ -205,6 +189,9 @@ func (statusLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 }
 
 func (s *statusIndicator) Set(level statusLevel, text string) {
+	if s.level == level && s.label.Text == text {
+		return
+	}
 	s.level = level
 	s.label.Text = text
 	s.Refresh()
@@ -213,8 +200,6 @@ func (s *statusIndicator) Set(level statusLevel, text string) {
 // Refresh is also called by Fyne on light/dark changes, which re-resolves the dot colour.
 func (s *statusIndicator) Refresh() {
 	s.applyLevel()
-	s.dot.Refresh()
-	s.label.Refresh()
 	s.BaseWidget.Refresh()
 }
 
@@ -273,7 +258,7 @@ func newSection(title string, objs ...fyne.CanvasObject) fyne.CanvasObject {
 // checkbox) on the right of the heading.
 func newSectionWithAction(title string, action fyne.CanvasObject, objs ...fyne.CanvasObject) fyne.CanvasObject {
 	heading := newSubtleText(title)
-	heading.Segments[0].(*widget.TextSegment).Style.TextStyle = fyne.TextStyle{Bold: true}
+	subtleStyle(heading).TextStyle = fyne.TextStyle{Bold: true}
 	var top fyne.CanvasObject = heading
 	if action != nil {
 		top = container.NewBorder(nil, nil, nil, action, container.NewVBox(layout.NewSpacer(), heading, layout.NewSpacer()))
@@ -311,8 +296,7 @@ func newTapRow(title string, trailing fyne.CanvasObject, icon fyne.Resource, onT
 		icon = theme.NavigateNextIcon()
 	}
 	iconWidget := widget.NewIcon(icon)
-	// Inset the icon so its edge mirrors the label's text inset on the left.
-	right := container.NewHBox(container.New(layout.NewCustomPaddedLayout(0, 0, 0, theme.Padding()), iconWidget))
+	right := container.NewHBox(trailingInset(iconWidget))
 	if trailing != nil {
 		right.Objects = append([]fyne.CanvasObject{trailing}, right.Objects...)
 	}
@@ -342,7 +326,7 @@ func (r *tapRow) Tapped(*fyne.PointEvent) {
 			c.Unfocus()
 		}
 	}
-	r.Refresh()
+	r.updateBg()
 	r.activate()
 }
 
@@ -359,13 +343,13 @@ func (r *tapRow) Cursor() desktop.Cursor { return desktop.PointerCursor }
 func (r *tapRow) FocusGained() {
 	r.focused = true
 	r.ring = !r.hovered
-	r.Refresh()
+	r.updateBg()
 }
 
 func (r *tapRow) FocusLost() {
 	r.focused = false
 	r.ring = false
-	r.Refresh()
+	r.updateBg()
 }
 
 func (r *tapRow) TypedRune(rn rune) {
@@ -375,41 +359,49 @@ func (r *tapRow) TypedRune(rn rune) {
 }
 
 func (r *tapRow) TypedKey(ev *fyne.KeyEvent) {
-	if ev.Name == fyne.KeyReturn || ev.Name == fyne.KeyEnter {
+	switch ev.Name {
+	case fyne.KeyReturn, fyne.KeyEnter:
 		r.activate()
+	case fyne.KeyEscape:
+		sheetKey(ev)
 	}
 }
 
 func (r *tapRow) MouseIn(*desktop.MouseEvent) {
 	r.hovered = true
-	r.Refresh()
+	r.updateBg()
 }
 
 // MouseMoved restores the hover cleared by Tapped once the pointer moves again.
 func (r *tapRow) MouseMoved(*desktop.MouseEvent) {
 	if !r.hovered {
 		r.hovered = true
-		r.Refresh()
+		r.updateBg()
 	}
 }
 
 func (r *tapRow) MouseOut() {
 	r.hovered = false
-	r.Refresh()
+	r.updateBg()
 }
 
-func (r *tapRow) Refresh() {
+// updateBg redraws only the background; hover and focus change nothing else.
+func (r *tapRow) updateBg() {
 	if r.hovered {
 		r.bg.FillColor = theme.Color(theme.ColorNameHover)
 	} else {
 		r.bg.FillColor = color.Transparent
 	}
-	if r.focused && r.ring {
+	if r.ring {
 		r.bg.StrokeColor = theme.Color(theme.ColorNameFocus)
 	} else {
 		r.bg.StrokeColor = color.Transparent
 	}
 	r.bg.Refresh()
+}
+
+func (r *tapRow) Refresh() {
+	r.updateBg()
 	r.BaseWidget.Refresh()
 }
 
@@ -425,22 +417,53 @@ func newSubtleText(text string) *widget.RichText {
 	})
 }
 
+// subtleStyle is the style of text made by newSubtleText, for callers that
+// need monospace, bold or a different alignment.
+func subtleStyle(rt *widget.RichText) *widget.RichTextStyle {
+	return &rt.Segments[0].(*widget.TextSegment).Style
+}
+
 func setSubtleText(rt *widget.RichText, text string) {
 	rt.Segments[0].(*widget.TextSegment).Text = text
 	rt.Refresh()
 }
 
-func newIconButton(icon fyne.Resource, onTapped func()) *widget.Button {
-	btn := widget.NewButtonWithIcon("", icon, onTapped)
+// trailingInset pads o on the right so a trailing icon's edge mirrors the
+// text inset of labels on the left.
+func trailingInset(o fyne.CanvasObject) fyne.CanvasObject {
+	return container.New(layout.NewCustomPaddedLayout(0, 0, 0, theme.Padding()), o)
+}
+
+const flashDuration = 1500 * time.Millisecond
+
+// flash applies a temporary state now and resets it after flashDuration.
+func flash(set, reset func()) {
+	set()
+	time.AfterFunc(flashDuration, func() { fyne.Do(reset) })
+}
+
+func newIconButton(icon fyne.Resource, onTapped func()) *keyButton {
+	btn := newKeyButton("", onTapped)
+	btn.Icon = icon
 	btn.Importance = widget.LowImportance
 	return btn
 }
 
-func flashButtonIcon(btn *widget.Button, temp, original fyne.Resource) {
-	btn.SetIcon(temp)
-	time.AfterFunc(1500*time.Millisecond, func() {
-		fyne.Do(func() { btn.SetIcon(original) })
+// newCopyButton copies value() to the clipboard and briefly shows a tick.
+func newCopyButton(clip fyne.Clipboard, value func() string) *keyButton {
+	var btn *keyButton
+	btn = newIconButton(theme.ContentCopyIcon(), func() {
+		clip.SetContent(value())
+		flash(func() { btn.SetIcon(theme.ConfirmIcon()) }, func() { btn.SetIcon(theme.ContentCopyIcon()) })
 	})
+	return btn
+}
+
+// setChecked changes a checkbox without calling its OnChanged.
+func setChecked(cb *widget.Check, on bool) {
+	cb.Partial = false
+	cb.Checked = on
+	cb.Refresh()
 }
 
 type sheetButton struct {
@@ -452,47 +475,57 @@ type sheetButton struct {
 // sheet is a modal panel used instead of Fyne's dialogs, whose fixed layout
 // reserves a title row and centres icon buttons at the bottom.
 type sheet struct {
-	pop       *widget.PopUp
-	canvas    fyne.Canvas
-	onClosed  func()
-	primary   func()
-	prevOnKey func(*fyne.KeyEvent)
-	prevFocus fyne.Focusable
+	pop         *widget.PopUp
+	canvas      fyne.Canvas
+	onClosed    func()
+	primary     func()
+	restoreKeys func()
+	prevFocus   fyne.Focusable
+}
+
+// openSheets is the stack of visible sheets; the top one gets Escape/Return.
+var openSheets []*sheet
+
+// sheetKey sends Escape (cancel) and Return (primary action) to the topmost
+// open sheet and reports whether it took the key. Fyne gives keys only to the
+// focused widget while one has focus, so the widgets used in sheets
+// (keyCheck, keyButton, tapRow, escapeEntry) forward these keys here; the
+// canvas hook set in Show covers the case where nothing is focused.
+func sheetKey(ev *fyne.KeyEvent) bool {
+	if len(openSheets) == 0 {
+		return false
+	}
+	s := openSheets[len(openSheets)-1]
+	switch ev.Name {
+	case fyne.KeyEscape:
+		s.Hide()
+		return true
+	case fyne.KeyReturn, fyne.KeyEnter:
+		if s.primary != nil {
+			s.primary()
+			return true
+		}
+	}
+	return false
 }
 
 // sheetMargin keeps sheets clear of the window edges.
 const sheetMargin = 16
 
-// Show opens the sheet with Escape bound to cancel and Return to the primary
-// button, and remembers the focused widget so Hide can return focus to it.
-//
-// Keys go through the desktop canvas's key-down hook, which Fyne calls even
-// while a checkbox or button inside the sheet has focus (only text entries
-// swallow it; see escapeEntry). Canvases without that hook fall back to
-// OnTypedKey, which only fires when nothing is focused.
+// Show opens the sheet, routes Escape and Return to it (see sheetKey) and
+// remembers the focused widget so Hide can return focus to it.
 func (s *sheet) Show() {
 	s.prevFocus = s.canvas.Focused()
-	handle := func(ev *fyne.KeyEvent) {
-		switch ev.Name {
-		case fyne.KeyEscape:
-			s.Hide()
-		case fyne.KeyReturn, fyne.KeyEnter:
-			// A focused button or row handles Return itself; only fire the
-			// primary action when focus is nowhere or on a checkbox.
-			switch s.canvas.Focused().(type) {
-			case nil, *widget.Check:
-				if s.primary != nil {
-					s.primary()
-				}
-			}
-		}
-	}
+	openSheets = append(openSheets, s)
+	handle := func(ev *fyne.KeyEvent) { sheetKey(ev) }
 	if dc, ok := s.canvas.(desktop.Canvas); ok {
-		s.prevOnKey = dc.OnKeyDown()
+		prev := dc.OnKeyDown()
 		dc.SetOnKeyDown(handle)
+		s.restoreKeys = func() { dc.SetOnKeyDown(prev) }
 	} else {
-		s.prevOnKey = s.canvas.OnTypedKey()
+		prev := s.canvas.OnTypedKey()
 		s.canvas.SetOnTypedKey(handle)
+		s.restoreKeys = func() { s.canvas.SetOnTypedKey(prev) }
 	}
 	s.canvas.Unfocus()
 	s.pop.Show()
@@ -518,11 +551,13 @@ func (s *sheet) Hide() {
 	if !s.pop.Visible() {
 		return
 	}
-	if dc, ok := s.canvas.(desktop.Canvas); ok {
-		dc.SetOnKeyDown(s.prevOnKey)
-	} else {
-		s.canvas.SetOnTypedKey(s.prevOnKey)
+	for i, open := range openSheets {
+		if open == s {
+			openSheets = append(openSheets[:i], openSheets[i+1:]...)
+			break
+		}
 	}
+	s.restoreKeys()
 	s.pop.Hide()
 	if s.prevFocus != nil {
 		s.canvas.Focus(s.prevFocus)
@@ -549,7 +584,7 @@ func newSheet(parent fyne.Window, title, message string, content fyne.CanvasObje
 	s := &sheet{canvas: parent.Canvas()}
 	row := container.NewHBox(layout.NewSpacer())
 	for _, b := range buttons {
-		btn := widget.NewButton(b.label, func() {
+		btn := newKeyButton(b.label, func() {
 			s.Hide()
 			if b.onTap != nil {
 				b.onTap()
@@ -574,19 +609,57 @@ func newSheet(parent fyne.Window, title, message string, content fyne.CanvasObje
 	return s
 }
 
-// escapeEntry is an Entry that reports Escape. Entries swallow key-down
-// events, so a sheet's own Escape handling can't see them.
+// escapeEntry is an Entry that lets its owner handle Escape first (to clear
+// a search, say) and otherwise passes Escape to the open sheet. Return is
+// left to the entry so typing never submits the sheet.
 type escapeEntry struct {
 	widget.Entry
-	OnEscape func()
+	// OnEscape reports whether it handled the key.
+	OnEscape func() bool
 }
 
 func (e *escapeEntry) TypedKey(ev *fyne.KeyEvent) {
-	if ev.Name == fyne.KeyEscape && e.OnEscape != nil {
-		e.OnEscape()
-		return
+	if ev.Name == fyne.KeyEscape {
+		if (e.OnEscape != nil && e.OnEscape()) || sheetKey(ev) {
+			return
+		}
 	}
 	e.Entry.TypedKey(ev)
+}
+
+// keyCheck is a Check that passes Escape and Return to the open sheet.
+type keyCheck struct{ widget.Check }
+
+func newKeyCheck(label string, changed func(bool)) *keyCheck {
+	c := &keyCheck{}
+	c.Text = label
+	c.OnChanged = changed
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *keyCheck) TypedKey(ev *fyne.KeyEvent) {
+	if !sheetKey(ev) {
+		c.Check.TypedKey(ev)
+	}
+}
+
+// keyButton is a Button that passes Escape and Return to the open sheet;
+// Space still presses the button itself.
+type keyButton struct{ widget.Button }
+
+func newKeyButton(label string, tapped func()) *keyButton {
+	b := &keyButton{}
+	b.Text = label
+	b.OnTapped = tapped
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *keyButton) TypedKey(ev *fyne.KeyEvent) {
+	if !sheetKey(ev) {
+		b.Button.TypedKey(ev)
+	}
 }
 
 // newSearchEntry is an Entry with a search icon inset from its right edge.
@@ -594,7 +667,7 @@ func newSearchEntry(placeholder string) *escapeEntry {
 	e := &escapeEntry{}
 	e.ExtendBaseWidget(e)
 	e.SetPlaceHolder(placeholder)
-	e.ActionItem = container.New(layout.NewCustomPaddedLayout(0, 0, 0, theme.Padding()), widget.NewIcon(theme.SearchIcon()))
+	e.ActionItem = trailingInset(widget.NewIcon(theme.SearchIcon()))
 	return e
 }
 

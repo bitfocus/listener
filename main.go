@@ -1511,11 +1511,7 @@ func refreshConnectionStatus() {
 	var status, summary, detail string
 	level := statusIdle
 	if activeConnections > 0 {
-		status = fmt.Sprintf("Connected (%d client", activeConnections)
-		if activeConnections > 1 {
-			status += "s"
-		}
-		status += ")"
+		status = fmt.Sprintf("Connected (%s)", plural(activeConnections, "client", "clients"))
 		summary = fmt.Sprintf("%d connected", activeConnections)
 		level = statusOK
 		ips := authenticatedClientIPs()
@@ -1869,13 +1865,19 @@ func showAllowedCommandsDialog(parent fyne.Window, updateStatusCallback func()) 
 	for _, cmd := range defaultCommands {
 		available[cmd] = true
 	}
-	checkboxes := make(map[string]*widget.Check)
+	checkboxes := make(map[string]*keyCheck)
+	// checkAll ticks or clears cbs through SetChecked, so group headers resync.
+	checkAll := func(cbs []*keyCheck, on bool) {
+		for _, cb := range cbs {
+			cb.SetChecked(on)
+		}
+	}
 	newGroup := func(name string, cmds []string) fyne.CanvasObject {
 		// The group's "Allow all" mirrors its actions: ticked when all are on,
-		// a dash when only some are. Its fields are set directly so syncing it
-		// doesn't fire its own OnChanged and flip every action.
-		groupCheck := widget.NewCheck("Allow all", nil)
-		var members []*widget.Check
+		// a dash when only some are. It is updated with setChecked so syncing
+		// it doesn't fire its own OnChanged and flip every action.
+		groupCheck := newKeyCheck("Allow all", nil)
+		var members []*keyCheck
 		syncGroup := func() {
 			on := 0
 			for _, cb := range members {
@@ -1883,7 +1885,7 @@ func showAllowedCommandsDialog(parent fyne.Window, updateStatusCallback func()) 
 					on++
 				}
 			}
-			groupCheck.Checked = on == len(members)
+			setChecked(&groupCheck.Check, on == len(members))
 			groupCheck.Partial = on > 0 && on < len(members)
 			groupCheck.Refresh()
 		}
@@ -1894,18 +1896,14 @@ func showAllowedCommandsDialog(parent fyne.Window, updateStatusCallback func()) 
 			if !exists {
 				description = cmd
 			}
-			cb := widget.NewCheck(description, func(bool) { syncGroup() })
-			cb.SetChecked(allowedNow[cmd])
+			cb := newKeyCheck(description, func(bool) { syncGroup() })
+			setChecked(&cb.Check, allowedNow[cmd])
 			checkboxes[cmd] = cb
 			members = append(members, cb)
 			objs = append(objs, cb)
 		}
 		syncGroup()
-		groupCheck.OnChanged = func(on bool) {
-			for _, cb := range members {
-				cb.SetChecked(on)
-			}
-		}
+		groupCheck.OnChanged = func(on bool) { checkAll(members, on) }
 		return newSectionWithAction(name, groupCheck, objs...)
 	}
 
@@ -1959,14 +1957,13 @@ func showAllowedCommandsDialog(parent fyne.Window, updateStatusCallback func()) 
 		}
 	}
 
-	setAll := func(on bool) {
-		for _, cb := range checkboxes {
-			cb.SetChecked(on)
-		}
+	all := make([]*keyCheck, 0, len(checkboxes))
+	for _, cb := range checkboxes {
+		all = append(all, cb)
 	}
-	allowAll := widget.NewButton("Allow all", func() { setAll(true) })
+	allowAll := newKeyButton("Allow all", func() { checkAll(all, true) })
 	allowAll.Importance = widget.LowImportance
-	disableAll := widget.NewButton("Disable all", func() { setAll(false) })
+	disableAll := newKeyButton("Disable all", func() { checkAll(all, false) })
 	disableAll.Importance = widget.LowImportance
 	intro := widget.NewLabel("Choose which commands clients can run.")
 	intro.Truncation = fyne.TextTruncateEllipsis
@@ -2154,13 +2151,15 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 	}
 	configMu.RUnlock()
 
-	categoryCheckboxes := make(map[string]*widget.Check)
-	keyCheckboxes := make(map[string]*widget.Check)
+	categoryCheckboxes := make(map[string]*keyCheck)
+	keyCheckboxes := make(map[string]*keyCheck)
 	// keyAllowed holds each key's own setting. It is kept separately from the
 	// checkbox because a key is shown checked and locked while its whole
 	// category is allowed, and must revert when the category is unticked.
 	keyAllowed := make(map[string]bool)
-	syncing := false
+	// searchText is each key's lowercased display name and id, built once
+	// rather than on every keystroke in the search field.
+	searchText := make(map[string]string)
 
 	countText := newSubtleText("")
 	updateSelectionCount := func() {
@@ -2188,7 +2187,6 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 	type categoryView struct {
 		row      fyne.CanvasObject
 		sep      fyne.CanvasObject
-		grid     *fyne.Container
 		keys     fyne.CanvasObject
 		toggle   *tapRow
 		expanded bool
@@ -2200,6 +2198,9 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 	// user's choice, which a search temporarily overrides and clearing it
 	// restores.
 	showKeys := func(v *categoryView, open bool) {
+		if open == v.keys.Visible() {
+			return
+		}
 		if open {
 			v.toggle.SetIcon(theme.MenuDropDownIcon())
 			v.keys.Show()
@@ -2214,18 +2215,16 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 	}
 	applyCategoryLock := func(cat string) {
 		whole := categoryCheckboxes[cat].Checked
-		syncing = true
 		for _, k := range keyCategories[cat] {
 			cb := keyCheckboxes[k]
 			if whole {
-				cb.SetChecked(true)
+				setChecked(&cb.Check, true)
 				cb.Disable()
 			} else {
-				cb.SetChecked(keyAllowed[k])
+				setChecked(&cb.Check, keyAllowed[k])
 				cb.Enable()
 			}
 		}
-		syncing = false
 	}
 
 	var categoryRows []fyne.CanvasObject
@@ -2234,26 +2233,24 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 		var keyChecks []fyne.CanvasObject
 		for _, k := range keys {
 			keyAllowed[k] = keysNow[k]
-			cb := widget.NewCheck(getKeyDisplayName(k), func(on bool) {
-				if syncing {
-					return
-				}
+			searchText[k] = strings.ToLower(getKeyDisplayName(k) + " " + k)
+			cb := newKeyCheck(getKeyDisplayName(k), func(on bool) {
 				keyAllowed[k] = on
 				updateSelectionCount()
 			})
-			cb.SetChecked(keysNow[k])
 			keyCheckboxes[k] = cb
 			keyChecks = append(keyChecks, cb)
 		}
 
-		catCheck := widget.NewCheck("Allow all", func(bool) {
+		catCheck := newKeyCheck("Allow all", func(bool) {
 			applyCategoryLock(cat)
 			updateSelectionCount()
 		})
+		setChecked(&catCheck.Check, categoriesNow[cat])
 		categoryCheckboxes[cat] = catCheck
-		catCheck.SetChecked(categoriesNow[cat])
+		applyCategoryLock(cat)
 
-		v := &categoryView{grid: container.NewGridWithColumns(3, keyChecks...)}
+		v := &categoryView{}
 		// The name row expands the key list; "Allow all" sits apart so the two
 		// actions can't be confused.
 		count := newSubtleText(fmt.Sprintf("%d keys", len(keys)))
@@ -2262,10 +2259,8 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			relayout()
 		})
 		header := container.NewBorder(nil, nil, nil, catCheck, v.toggle)
-		// Hide this wrapper, not the grid: the theme override keeps reporting
-		// its content's size, so a hidden grid would still leave a gap.
 		v.keys = container.New(layout.NewCustomPaddedLayout(0, theme.Padding(), 3*theme.Padding(), 0),
-			container.NewThemeOverride(v.grid, readableDisabledTheme{fyne.CurrentApp().Settings().Theme()}))
+			container.NewGridWithColumns(3, keyChecks...))
 		v.row = container.NewVBox(header, v.keys)
 		setExpanded(v, false)
 		views[cat] = v
@@ -2275,9 +2270,6 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			categoryRows = append(categoryRows, v.sep)
 		}
 		categoryRows = append(categoryRows, v.row)
-	}
-	for _, cat := range sortedCategories {
-		applyCategoryLock(cat)
 	}
 	updateSelectionCount()
 
@@ -2290,9 +2282,7 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			matches := 0
 			for _, k := range keyCategories[cat] {
 				cb := keyCheckboxes[k]
-				if filter == "" ||
-					strings.Contains(strings.ToLower(getKeyDisplayName(k)), filter) ||
-					strings.Contains(strings.ToLower(k), filter) {
+				if filter == "" || strings.Contains(searchText[k], filter) {
 					cb.Show()
 					matches++
 				} else {
@@ -2327,11 +2317,11 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 		relayout()
 	}
 
-	restrictedSection := container.NewVBox(
-		searchEntry,
-		newSection("Categories", categoryRows...),
-		countText,
-	)
+	// Locked keys are disabled checkboxes; this one override keeps them
+	// readable (see readableDisabledTheme). Nothing else in it is disabled.
+	categories := container.NewThemeOverride(newSection("Categories", categoryRows...),
+		readableDisabledTheme{fyne.CurrentApp().Settings().Theme()})
+	restrictedSection := container.NewVBox(searchEntry, categories, countText)
 
 	const fullAccessOption, restrictedOption = "All keys", "Only selected keys"
 	modeRadio := widget.NewRadioGroup([]string{fullAccessOption, restrictedOption}, func(selected string) {
@@ -2342,20 +2332,18 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 			selectedMode = "restricted"
 			restrictedSection.Show()
 		}
-		if relayout != nil {
-			relayout()
-		}
+		relayout()
 	})
 	modeRadio.Horizontal = true
 	modeRadio.Required = true
+
+	content := container.NewVBox(newSection("Allow", modeRadio), restrictedSection)
+	relayout = content.Refresh
 	if selectedMode == "full_access" {
 		modeRadio.SetSelected(fullAccessOption)
 	} else {
 		modeRadio.SetSelected(restrictedOption)
 	}
-
-	content := container.NewVBox(newSection("Allow", modeRadio), restrictedSection)
-	relayout = content.Refresh
 
 	save := func() {
 		configMu.Lock()
@@ -2408,13 +2396,14 @@ func showKeyControlDialog(parent fyne.Window, updateStatusCallback func()) {
 		sheetButton{label: "Cancel"},
 		sheetButton{label: "Save", importance: widget.HighImportance, onTap: save},
 	)
-	// Escape in the search field clears it first, then closes the sheet.
-	searchEntry.OnEscape = func() {
-		if searchEntry.Text != "" {
-			searchEntry.SetText("")
-		} else {
-			d.Hide()
+	// Escape in the search field clears it first; with it empty, Escape
+	// falls through to the sheet and closes it.
+	searchEntry.OnEscape = func() bool {
+		if searchEntry.Text == "" {
+			return false
 		}
+		searchEntry.SetText("")
+		return true
 	}
 	d.Resize(fyne.NewSize(600, 640))
 	d.Show()
@@ -2454,10 +2443,8 @@ func showActivityLogDialog(parent fyne.Window) {
 	logList.OnSelected = func(i widget.ListItemID) {
 		if i < len(lines) {
 			parent.Clipboard().SetContent(lines[i].full)
-			setSubtleText(copyHint, "Copied to clipboard")
-			time.AfterFunc(1500*time.Millisecond, func() {
-				fyne.Do(func() { setSubtleText(copyHint, copyHintText) })
-			})
+			flash(func() { setSubtleText(copyHint, "Copied to clipboard") },
+				func() { setSubtleText(copyHint, copyHintText) })
 		}
 		logList.UnselectAll()
 	}
@@ -2518,14 +2505,10 @@ func showActivityLogDialog(parent fyne.Window) {
 	if audit != nil {
 		logFilePath = audit.filePath
 	}
-	var copyPathBtn *widget.Button
-	copyPathBtn = newIconButton(theme.ContentCopyIcon(), func() {
-		parent.Clipboard().SetContent(logFilePath)
-		flashButtonIcon(copyPathBtn, theme.ConfirmIcon(), theme.ContentCopyIcon())
-	})
+	copyPathBtn := newCopyButton(parent.Clipboard(), func() string { return logFilePath })
 	pathText := newSubtleText(logFilePath)
-	pathText.Segments[0].(*widget.TextSegment).Style.TextStyle = fyne.TextStyle{Monospace: true}
-	pathText.Segments[0].(*widget.TextSegment).Style.Inline = false
+	subtleStyle(pathText).TextStyle = fyne.TextStyle{Monospace: true}
+	subtleStyle(pathText).Inline = false
 	pathText.Wrapping = fyne.TextWrapBreak
 
 	content := container.NewBorder(
@@ -2548,7 +2531,7 @@ func startGUI() {
 }
 
 func buildMainWindow(myApp fyne.App) fyne.Window {
-	myApp.Settings().SetTheme(listenerTheme{theme.DefaultTheme()})
+	myApp.Settings().SetTheme(newListenerTheme())
 	guiStarted.Store(true)
 	appIcon := fyne.NewStaticResource("icon.png", iconPNG)
 	myApp.SetIcon(appIcon)
@@ -2567,16 +2550,11 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 	portError.SizeName = theme.SizeNameCaptionText
 	portError.Hide()
 
-	// Called from restartServer's goroutine.
-	applyBindUI := func(error) {
-		fyne.Do(refreshListenStatusUI)
-	}
-
 	restartWithCurrentBind := func() {
 		configMu.RLock()
 		iface, port := config.Interface, config.Port
 		configMu.RUnlock()
-		restartServer(iface, port, applyBindUI)
+		restartServer(iface, port, nil)
 	}
 
 	bindErrorLabel = widget.NewLabel("")
@@ -2685,7 +2663,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		configMu.Unlock()
 		auditLog("gui", "INTERFACE_CHANGED", fmt.Sprintf("bind=%s", newIP))
 		targetHostLabel.SetText(websocketTargetHost())
-		restartServer(iface, port, applyBindUI)
+		restartServer(iface, port, nil)
 	})
 	ifaceSelect.SetSelected(initialIface)
 
@@ -2731,7 +2709,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		configMu.Unlock()
 		portEntry.SetText(newPort)
 		auditLog("gui", "PORT_CHANGED", fmt.Sprintf("port=%s", newPort))
-		restartServer(iface, port, applyBindUI)
+		restartServer(iface, port, nil)
 	}
 	applyPortBtn = widget.NewButton("Apply", applyPort)
 	applyPortBtn.Importance = widget.HighImportance
@@ -2746,9 +2724,6 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		}
 	}
 	portEntry.OnChanged = func(text string) {
-		if !guiReady {
-			return
-		}
 		newPort, ok := parsePort(text)
 		if ok {
 			portError.Hide()
@@ -2825,7 +2800,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 	}
 	refreshPasswordDisplay()
 
-	var showHideBtn *widget.Button
+	var showHideBtn *keyButton
 	showHideBtn = newIconButton(theme.VisibilityIcon(), func() {
 		passwordMasked = !passwordMasked
 		if passwordMasked {
@@ -2836,11 +2811,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		refreshPasswordDisplay()
 	})
 
-	var copyPasswordBtn *widget.Button
-	copyPasswordBtn = newIconButton(theme.ContentCopyIcon(), func() {
-		w.Clipboard().SetContent(currentPassword())
-		flashButtonIcon(copyPasswordBtn, theme.ConfirmIcon(), theme.ContentCopyIcon())
-	})
+	copyPasswordBtn := newCopyButton(w.Clipboard(), currentPassword)
 
 	generateBtn := newIconButton(theme.ViewRefreshIcon(), func() {
 		d := newSheet(w, "Generate a new password?",
@@ -2866,11 +2837,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		d.Show()
 	})
 
-	var copyHostBtn *widget.Button
-	copyHostBtn = newIconButton(theme.ContentCopyIcon(), func() {
-		w.Clipboard().SetContent(websocketTargetHost())
-		flashButtonIcon(copyHostBtn, theme.ConfirmIcon(), theme.ContentCopyIcon())
-	})
+	copyHostBtn := newCopyButton(w.Clipboard(), websocketTargetHost)
 
 	statusSection := newSection("Status",
 		container.NewBorder(nil, nil, widget.NewLabel("Server"), serverStatus),
@@ -2930,8 +2897,8 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		}
 	}
 	footerText := newSubtleText(fmt.Sprintf("Bitfocus AS © %d  ·  %s\n%s", copyrightYear, HumanVersion, trayHint))
-	footerText.Segments[0].(*widget.TextSegment).Style.Alignment = fyne.TextAlignCenter
-	footerText.Segments[0].(*widget.TextSegment).Style.Inline = false
+	subtleStyle(footerText).Alignment = fyne.TextAlignCenter
+	subtleStyle(footerText).Inline = false
 
 	page := container.NewVBox(bindErrorBanner, statusSection, connectionSection, securitySection, generalSection)
 	margin := 2 * theme.Padding()
