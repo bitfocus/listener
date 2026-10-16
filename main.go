@@ -927,6 +927,7 @@ func toggleKey(key string, down bool) error {
 
 func sendKeyError(client *Client, err error) {
 	log.Printf("Key event failed: %v", err)
+	auditLog(client.IP, "COMMAND_FAILED", err.Error())
 	_ = client.writeJSON(map[string]interface{}{
 		"type":    "error",
 		"message": err.Error(),
@@ -1051,7 +1052,11 @@ func handleCommand(client *Client, cmd Command) {
 		configMu.RUnlock()
 		if !exists || !allowed {
 			log.Printf("Command %s is disabled", cmd.Type)
-			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s is disabled", cmd.Type))
+			reason := "is disabled"
+			if !exists {
+				reason = "is not a known command"
+			}
+			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s %s", truncateForLog(cmd.Type, 60), reason))
 			_ = client.writeJSON(map[string]interface{}{
 				"type":    "error",
 				"message": "Command " + cmd.Type + " is disabled on the server",
@@ -1208,6 +1213,7 @@ func handleCommand(client *Client, cmd Command) {
 			// Validate processName to prevent AppleScript injection
 			if !validAppleScriptName.MatchString(cmd.ProcessName) {
 				log.Printf("Invalid process name rejected: %q", cmd.ProcessName)
+				auditLog(client.IP, "BLOCKED", fmt.Sprintf("osxKeyPressProcess invalid process=%q", truncateForLog(cmd.ProcessName, 60)))
 				client.writeJSON(map[string]interface{}{
 					"type":    "error",
 					"message": "Invalid process name",
@@ -1220,6 +1226,7 @@ func handleCommand(client *Client, cmd Command) {
 			// Validate key contains no AppleScript injection characters
 			if strings.ContainsAny(cmd.Key, "\"\\") {
 				log.Printf("Invalid key rejected: %q", cmd.Key)
+				auditLog(client.IP, "BLOCKED", fmt.Sprintf("osxKeyPressProcess invalid key=%q", truncateForLog(cmd.Key, 60)))
 				client.writeJSON(map[string]interface{}{
 					"type":    "error",
 					"message": "Invalid key value",
@@ -1232,10 +1239,14 @@ func handleCommand(client *Client, cmd Command) {
 				return
 			}
 			auditLog(client.IP, "osxKeyPressProcess", fmt.Sprintf("process=%s key=%s modifiers=%v", cmd.ProcessName, cmd.Key, cmd.Modifiers))
-			processName := cmd.ProcessName
+			processName, clientIP := cmd.ProcessName, client.IP
 			go func() {
-				_ = runOsascript(fmt.Sprintf("tell application %q to activate", processName))
-				_ = runOsascript(script)
+				if err := runOsascript(fmt.Sprintf("tell application %q to activate", processName)); err != nil {
+					auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("osxKeyPressProcess activate %s: %v", processName, err))
+				}
+				if err := runOsascript(script); err != nil {
+					auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("osxKeyPressProcess key=%s: %v", cmd.Key, err))
+				}
 				log.Printf("Sent OSXKeyPressProcess command to %s", processName)
 			}()
 		} else {
@@ -1247,13 +1258,14 @@ func handleCommand(client *Client, cmd Command) {
 		// Disable this command in AllowedCommands if unrestricted AppleScript execution is not desired.
 		if runtime.GOOS == "darwin" {
 			auditLog(client.IP, "osxAppleScript", truncateForLog(cmd.Msg, 100))
-			msg := cmd.Msg
+			msg, clientIP := cmd.Msg, client.IP
 			go func() {
 				// osxAppleScript intentionally runs arbitrary operator-supplied AppleScript;
 				// it requires authentication and can be disabled via AllowedCommands.
 				// nosec
 				if err := exec.Command("osascript", "-e", msg).Run(); err != nil {
 					log.Printf("OSXAppleScript error: %v", err)
+					auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("osxAppleScript: %v", err))
 				}
 				log.Printf("Executed OSXAppleScript: %s", truncateForLog(msg, 100))
 			}()
@@ -1291,7 +1303,7 @@ func handleCommand(client *Client, cmd Command) {
 		// it requires authentication and can be disabled via AllowedCommands. The
 		// command injection it "enables" is the documented purpose of this feature.
 		auditLog(client.IP, "shellRun", truncateForLog(cmd.Shell, 100))
-		shell := cmd.Shell
+		shell, clientIP := cmd.Shell, client.IP
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), shellTimeout)
 			defer cancel()
@@ -1307,6 +1319,7 @@ func handleCommand(client *Client, cmd Command) {
 			out, err := command.CombinedOutput()
 			if err != nil {
 				log.Printf("Shell command error: %v", err)
+				auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("shellRun %s: %v", truncateForLog(shell, 60), err))
 			}
 			log.Printf("Shell output: %s", truncateForLog(string(out), 500))
 		}()
@@ -1341,6 +1354,7 @@ func handleCommand(client *Client, cmd Command) {
 		hideCmdWindow(command)
 		if err := command.Start(); err != nil {
 			log.Printf("File open error: %v", err)
+			auditLog(client.IP, "COMMAND_FAILED", fmt.Sprintf("fileOpen %s: %v", target, err))
 		} else {
 			go func() { _ = command.Wait() }()
 		}
@@ -1379,6 +1393,7 @@ func handleCommand(client *Client, cmd Command) {
 
 	default:
 		log.Printf("Unknown command type: %s", cmd.Type)
+		auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s is not a known command", truncateForLog(cmd.Type, 60)))
 	}
 }
 
@@ -1699,10 +1714,17 @@ func restartServer(bindIP, port string, errorCallback func(err error)) {
 	go func() {
 		log.Printf("Restarting server to bind on %s:%s", bindIP, port)
 		applied, err := bindHTTPServer(bindIP, port)
-		if !applied || errorCallback == nil {
+		if !applied {
 			return
 		}
-		errorCallback(err)
+		if err != nil {
+			auditLog("gui", "SERVER_RESTART_FAILED", fmt.Sprintf("bind=%s:%s error=%v", bindIP, port, err))
+		} else {
+			auditLog("gui", "SERVER_RESTARTED", fmt.Sprintf("bind=%s:%s", bindIP, port))
+		}
+		if errorCallback != nil {
+			errorCallback(err)
+		}
 	}()
 }
 
@@ -1768,6 +1790,7 @@ func bindHTTPServer(bindIP, port string) (applied bool, err error) {
 		log.Printf("Server starting on %s", addr)
 		if serveErr := srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Printf("Server error: %v", serveErr)
+			auditLog("system", "SERVER_ERROR", fmt.Sprintf("bind=%s error=%v", addr, serveErr))
 			serverMu.Lock()
 			stillCurrent := currentServer == srv
 			serverMu.Unlock()
@@ -2548,6 +2571,7 @@ func showActivityLogDialog(parent fyne.Window) {
 
 func startGUI() {
 	buildMainWindow(app.New()).ShowAndRun()
+	auditLog("system", "STOPPED", "")
 }
 
 func buildMainWindow(myApp fyne.App) fyne.Window {
@@ -2983,6 +3007,7 @@ func main() {
 	startHTTPServer(config.Interface, config.Port, func(err error) {
 		if err != nil {
 			log.Printf("Initial binding error: %v", err)
+			auditLog("system", "SERVER_START_FAILED", fmt.Sprintf("bind=%s:%s error=%v", config.Interface, config.Port, err))
 		}
 	})
 	startGUI()
