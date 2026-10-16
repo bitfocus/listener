@@ -250,6 +250,63 @@ func (c *card) applyColors() {
 	c.bg.StrokeColor = withAlpha(fg, 0x1A)
 }
 
+// errorBanner is a solid error-coloured card with light text, for problems
+// that stop the app from working.
+type errorBanner struct {
+	widget.BaseWidget
+	bg     *canvas.Rectangle
+	title  *widget.Label
+	detail *widget.Label
+}
+
+func newErrorBanner() *errorBanner {
+	b := &errorBanner{
+		bg:     canvas.NewRectangle(color.Transparent),
+		title:  widget.NewLabel(""),
+		detail: widget.NewLabel(""),
+	}
+	b.bg.CornerRadius = 10
+	b.title.TextStyle = fyne.TextStyle{Bold: true}
+	b.title.Wrapping = fyne.TextWrapWord
+	b.detail.Wrapping = fyne.TextWrapWord
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *errorBanner) Set(title, detail string) {
+	b.title.SetText(title)
+	b.detail.SetText(detail)
+}
+
+func (b *errorBanner) CreateRenderer() fyne.WidgetRenderer {
+	b.bg.FillColor = theme.Color(theme.ColorNameError)
+	icon := widget.NewIcon(theme.NewColoredResource(theme.ErrorIcon(), theme.ColorNameForeground))
+	p := theme.Padding()
+	iconBox := container.New(layout.NewCustomPaddedLayout(0, 0, p, p), container.NewCenter(icon))
+	// Each label pads itself, so pull the detail up under the headline.
+	lines := container.New(layout.NewCustomPaddedVBoxLayout(-1.5*theme.InnerPadding()), b.title, b.detail)
+	text := container.New(layout.NewCustomPaddedLayout(0, 0, 0, p), lines)
+	// Light text reads on the red fill in both light and dark mode.
+	body := container.NewThemeOverride(container.NewBorder(nil, nil, iconBox, nil, text),
+		lightForegroundTheme{fyne.CurrentApp().Settings().Theme()})
+	return widget.NewSimpleRenderer(container.NewStack(b.bg, container.NewPadded(body)))
+}
+
+func (b *errorBanner) Refresh() {
+	b.bg.FillColor = theme.Color(theme.ColorNameError)
+	b.bg.Refresh()
+	b.BaseWidget.Refresh()
+}
+
+type lightForegroundTheme struct{ fyne.Theme }
+
+func (t lightForegroundTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if n == theme.ColorNameForeground {
+		return color.White
+	}
+	return t.Theme.Color(n, v)
+}
+
 func newSection(title string, objs ...fyne.CanvasObject) fyne.CanvasObject {
 	return newSectionWithAction(title, nil, objs...)
 }

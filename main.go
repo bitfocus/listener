@@ -85,8 +85,7 @@ var connMu sync.Mutex // protects activeConnections and connection status UI wid
 var clientsStatus *statusIndicator
 var clientsDetail *widget.RichText
 var serverStatus *statusIndicator
-var bindErrorLabel *widget.Label
-var bindErrorBanner fyne.CanvasObject
+var bindErrorBanner *errorBanner
 var refreshTrayMenu func(status string)
 
 // guiStarted is set once the Fyne app exists; fyne.Do needs a current app.
@@ -1565,13 +1564,34 @@ func refreshListenStatusUI() {
 		}
 		if err != nil {
 			serverStatus.Set(statusError, "Not listening")
-			bindErrorLabel.SetText(err.Error())
+			bindErrorBanner.Set(describeBindError(addr, err))
 			bindErrorBanner.Show()
 		} else {
 			serverStatus.Set(statusOK, "Listening on "+addr)
 			bindErrorBanner.Hide()
 		}
 	})
+}
+
+// describeBindError turns a listen failure into a headline and a next step the
+// user can act on, instead of the raw Go error.
+func describeBindError(addr string, err error) (string, string) {
+	port := addr
+	if _, p, splitErr := net.SplitHostPort(addr); splitErr == nil {
+		port = p
+	}
+	switch {
+	case errors.Is(err, errAddrInUse):
+		return fmt.Sprintf("Port %s is already in use", port),
+			"Another app, or another copy of Bitfocus Listener, is using this port. Close it or choose a different port below."
+	case errors.Is(err, errAddrDenied):
+		return fmt.Sprintf("Not allowed to use port %s", port),
+			"Your system blocked access to this port. Choose a port above 1024 below."
+	case errors.Is(err, errAddrNotAvail):
+		return "Network interface unavailable",
+			"The selected network interface is no longer available on this computer. Choose another interface below."
+	}
+	return "The server couldn't start", err.Error()
 }
 
 func preferredLocalIP() string {
@@ -2557,10 +2577,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		restartServer(iface, port, nil)
 	}
 
-	bindErrorLabel = widget.NewLabel("")
-	bindErrorLabel.Importance = widget.DangerImportance
-	bindErrorLabel.Wrapping = fyne.TextWrapWord
-	bindErrorBanner = newCard(container.NewBorder(nil, nil, widget.NewIcon(theme.ErrorIcon()), nil, bindErrorLabel))
+	bindErrorBanner = newErrorBanner()
 	bindErrorBanner.Hide()
 
 	connMu.Lock()
