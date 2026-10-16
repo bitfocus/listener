@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
@@ -85,8 +87,7 @@ var connMu sync.Mutex // protects activeConnections and connection status UI wid
 var clientsStatus *statusIndicator
 var clientsDetail *widget.RichText
 var serverStatus *statusIndicator
-var bindErrorLabel *widget.Label
-var bindErrorBanner fyne.CanvasObject
+var bindErrorBanner *errorBanner
 var refreshTrayMenu func(status string)
 
 // guiStarted is set once the Fyne app exists; fyne.Do needs a current app.
@@ -264,10 +265,54 @@ type AuditEntry struct {
 	IP     string
 	Action string
 	Detail string
+	// Repeats counts identical entries folded into this one; see AuditLogger.Log.
+	Repeats int
+	Last    time.Time
 }
 
 func (e AuditEntry) String() string {
-	return fmt.Sprintf("%s [%s] %s %s", e.Time.Format("2006-01-02 15:04:05"), e.IP, e.Action, e.Detail)
+	line := fmt.Sprintf("%s [%s] %s %s", e.Time.Format(time.RFC3339), e.IP, e.Action, e.Detail)
+	if e.Repeats > 0 {
+		line += fmt.Sprintf(" (×%d)", e.Repeats+1)
+	}
+	return line
+}
+
+// auditRepeatWindow is how close together identical entries must be to fold
+// into one line, so a button streaming commands doesn't flush the log.
+const auditRepeatWindow = 10 * time.Second
+
+// sameAuditEvent reports whether next repeats prev. mousePositionSet folds even
+// when the coordinates differ, as mouse moves arrive as a stream.
+func sameAuditEvent(prev, next AuditEntry) bool {
+	if prev.IP != next.IP || prev.Action != next.Action || next.Time.Sub(prev.Last) > auditRepeatWindow {
+		return false
+	}
+	return prev.Detail == next.Detail || next.Action == "mousePositionSet"
+}
+
+// sanitizeLogField escapes control characters so client-supplied text cannot
+// forge extra lines or terminal sequences in the log file.
+func sanitizeLogField(s string) string {
+	if !strings.ContainsFunc(s, unicode.IsControl) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case unicode.IsControl(r):
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // AuditLogger holds an in-memory ring buffer and writes to a log file.
@@ -325,9 +370,11 @@ func (a *AuditLogger) rotateIfNeeded() {
 	// nosec
 	f, err := os.OpenFile(a.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
+		// Put the file back and keep appending to it; the next write retries.
 		log.Printf("Failed to rotate audit log: %v", err)
-		a.file = nil
-		old.Close()
+		if err := os.Rename(oldPath, a.filePath); err != nil {
+			log.Printf("Failed to restore audit log after rotation error: %v", err)
+		}
 		return
 	}
 	a.file = f
@@ -336,15 +383,33 @@ func (a *AuditLogger) rotateIfNeeded() {
 }
 
 func (a *AuditLogger) Log(ip, action, detail string) {
+	now := time.Now()
 	entry := AuditEntry{
-		Time:   time.Now(),
-		IP:     ip,
-		Action: action,
-		Detail: detail,
+		Time:   now,
+		Last:   now,
+		IP:     sanitizeLogField(ip),
+		Action: sanitizeLogField(action),
+		Detail: sanitizeLogField(detail),
 	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.count > 0 {
+		last := &a.entries[(a.start+a.count-1)%auditRingSize]
+		if sameAuditEvent(*last, entry) {
+			last.Repeats++
+			last.Last = now
+			last.Detail = entry.Detail
+			a.seq++
+			return
+		}
+		// The file is append-only, so a folded run is summarised once it ends.
+		if last.Repeats > 0 {
+			a.writeLine(fmt.Sprintf("%s [%s] %s repeated %d more times, last %s",
+				last.Last.Format(time.RFC3339), last.IP, last.Action, last.Repeats, last.Detail))
+		}
+	}
 
 	if a.count < auditRingSize {
 		a.entries[(a.start+a.count)%auditRingSize] = entry
@@ -355,18 +420,21 @@ func (a *AuditLogger) Log(ip, action, detail string) {
 	}
 	a.seq++
 
-	// Write to file
+	a.writeLine(entry.String())
+}
+
+// writeLine appends one line to the log file. Caller must hold a.mu.
+func (a *AuditLogger) writeLine(line string) {
 	if a.file == nil {
 		return
 	}
-	line := entry.String() + "\n"
-	n, err := a.file.WriteString(line)
+	n, err := a.file.WriteString(line + "\n")
 	if err != nil {
 		log.Printf("Failed to write audit log: %v", err)
-	} else {
-		a.fileSize += int64(n)
-		a.rotateIfNeeded()
+		return
 	}
+	a.fileSize += int64(n)
+	a.rotateIfNeeded()
 }
 
 // Snapshot returns a copy of the ring buffer contents along with the total
@@ -392,11 +460,16 @@ func auditLog(ip, action, detail string) {
 
 // truncateForLog limits a string for safe log output.
 func truncateForLog(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+	s = sanitizeLogField(s)
+	if len(s) <= maxLen {
+		return s
 	}
-	return s
+	// Cut on a rune boundary so the log stays valid UTF-8.
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 // sanitizeOpenTarget validates a user-supplied target for the fileOpen command.
@@ -654,7 +727,9 @@ func logCommand(cmd Command) {
 		log.Printf("Received command: type=auth")
 	case "shellRun":
 		log.Printf("Received command: type=shellRun shell=%q", truncateForLog(cmd.Shell, 80))
-	case "osxAppleScript", "keyString":
+	case "keyString":
+		log.Printf("Received command: type=keyString chars=%d", utf8.RuneCountInString(cmd.Msg))
+	case "osxAppleScript":
 		log.Printf("Received command: type=%s msg=%q", cmd.Type, truncateForLog(cmd.Msg, 80))
 	default:
 		log.Printf("Received command: type=%s key=%q name=%q", cmd.Type, cmd.Key, cmd.Name)
@@ -928,6 +1003,7 @@ func toggleKey(key string, down bool) error {
 
 func sendKeyError(client *Client, err error) {
 	log.Printf("Key event failed: %v", err)
+	auditLog(client.IP, "COMMAND_FAILED", err.Error())
 	_ = client.writeJSON(map[string]interface{}{
 		"type":    "error",
 		"message": err.Error(),
@@ -1052,7 +1128,11 @@ func handleCommand(client *Client, cmd Command) {
 		configMu.RUnlock()
 		if !exists || !allowed {
 			log.Printf("Command %s is disabled", cmd.Type)
-			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s is disabled", cmd.Type))
+			reason := "is disabled"
+			if !exists {
+				reason = "is not a known command"
+			}
+			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s %s", truncateForLog(cmd.Type, 60), reason))
 			_ = client.writeJSON(map[string]interface{}{
 				"type":    "error",
 				"message": "Command " + cmd.Type + " is disabled on the server",
@@ -1209,6 +1289,7 @@ func handleCommand(client *Client, cmd Command) {
 			// Validate processName to prevent AppleScript injection
 			if !validAppleScriptName.MatchString(cmd.ProcessName) {
 				log.Printf("Invalid process name rejected: %q", cmd.ProcessName)
+				auditLog(client.IP, "BLOCKED", fmt.Sprintf("osxKeyPressProcess invalid process=%q", truncateForLog(cmd.ProcessName, 60)))
 				client.writeJSON(map[string]interface{}{
 					"type":    "error",
 					"message": "Invalid process name",
@@ -1221,6 +1302,7 @@ func handleCommand(client *Client, cmd Command) {
 			// Validate key contains no AppleScript injection characters
 			if strings.ContainsAny(cmd.Key, "\"\\") {
 				log.Printf("Invalid key rejected: %q", cmd.Key)
+				auditLog(client.IP, "BLOCKED", fmt.Sprintf("osxKeyPressProcess invalid key=%q", truncateForLog(cmd.Key, 60)))
 				client.writeJSON(map[string]interface{}{
 					"type":    "error",
 					"message": "Invalid key value",
@@ -1233,10 +1315,14 @@ func handleCommand(client *Client, cmd Command) {
 				return
 			}
 			auditLog(client.IP, "osxKeyPressProcess", fmt.Sprintf("process=%s key=%s modifiers=%v", cmd.ProcessName, cmd.Key, cmd.Modifiers))
-			processName := cmd.ProcessName
+			processName, clientIP := cmd.ProcessName, client.IP
 			go func() {
-				_ = runOsascript(fmt.Sprintf("tell application %q to activate", processName))
-				_ = runOsascript(script)
+				if err := runOsascript(fmt.Sprintf("tell application %q to activate", processName)); err != nil {
+					auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("osxKeyPressProcess activate %s: %v", processName, err))
+				}
+				if err := runOsascript(script); err != nil {
+					auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("osxKeyPressProcess key=%s: %v", cmd.Key, err))
+				}
 				log.Printf("Sent OSXKeyPressProcess command to %s", processName)
 			}()
 		} else {
@@ -1248,13 +1334,14 @@ func handleCommand(client *Client, cmd Command) {
 		// Disable this command in AllowedCommands if unrestricted AppleScript execution is not desired.
 		if runtime.GOOS == "darwin" {
 			auditLog(client.IP, "osxAppleScript", truncateForLog(cmd.Msg, 100))
-			msg := cmd.Msg
+			msg, clientIP := cmd.Msg, client.IP
 			go func() {
 				// osxAppleScript intentionally runs arbitrary operator-supplied AppleScript;
 				// it requires authentication and can be disabled via AllowedCommands.
 				// nosec
 				if err := exec.Command("osascript", "-e", msg).Run(); err != nil {
 					log.Printf("OSXAppleScript error: %v", err)
+					auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("osxAppleScript: %v", err))
 				}
 				log.Printf("Executed OSXAppleScript: %s", truncateForLog(msg, 100))
 			}()
@@ -1282,17 +1369,18 @@ func handleCommand(client *Client, cmd Command) {
 				return
 			}
 		}
-		auditLog(client.IP, "keyString", truncateForLog(cmd.Msg, 100))
+		// Typed text is often a password, so only its length is ever logged.
+		chars := utf8.RuneCountInString(cmd.Msg)
+		auditLog(client.IP, "keyString", fmt.Sprintf("chars=%d", chars))
 		typeString(cmd.Msg)
-		// Typed text can contain credentials; keep stdout as terse as the audit log.
-		log.Printf("Typed string: %s", truncateForLog(cmd.Msg, 100))
+		log.Printf("Typed string: %d chars", chars)
 
 	case "shellRun":
 		// shellRun intentionally executes arbitrary operator-supplied shell commands;
 		// it requires authentication and can be disabled via AllowedCommands. The
 		// command injection it "enables" is the documented purpose of this feature.
 		auditLog(client.IP, "shellRun", truncateForLog(cmd.Shell, 100))
-		shell := cmd.Shell
+		shell, clientIP := cmd.Shell, client.IP
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), shellTimeout)
 			defer cancel()
@@ -1308,6 +1396,7 @@ func handleCommand(client *Client, cmd Command) {
 			out, err := command.CombinedOutput()
 			if err != nil {
 				log.Printf("Shell command error: %v", err)
+				auditLog(clientIP, "COMMAND_FAILED", fmt.Sprintf("shellRun %s: %v", truncateForLog(shell, 60), err))
 			}
 			log.Printf("Shell output: %s", truncateForLog(string(out), 500))
 		}()
@@ -1342,6 +1431,7 @@ func handleCommand(client *Client, cmd Command) {
 		hideCmdWindow(command)
 		if err := command.Start(); err != nil {
 			log.Printf("File open error: %v", err)
+			auditLog(client.IP, "COMMAND_FAILED", fmt.Sprintf("fileOpen %s: %v", target, err))
 		} else {
 			go func() { _ = command.Wait() }()
 		}
@@ -1359,8 +1449,8 @@ func handleCommand(client *Client, cmd Command) {
 		}
 
 	case "mousePositionGet":
+		// Read-only and usually polled, so not audited.
 		x, y := getMousePos()
-		auditLog(client.IP, "mousePositionGet", fmt.Sprintf("x=%d y=%d", x, y))
 		response := map[string]interface{}{
 			"type": "mousePositionGetResponse",
 			"x":    x,
@@ -1380,14 +1470,42 @@ func handleCommand(client *Client, cmd Command) {
 
 	default:
 		log.Printf("Unknown command type: %s", cmd.Type)
+		auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s is not a known command", truncateForLog(cmd.Type, 60)))
 	}
 }
 
 // sendSysInfo pushes one metrics update. Returns false only when the WebSocket
 // write fails (caller should end the subscription). Metric collection errors
 // are logged and the subscription continues.
+// sysInfoMaxAge is just under the 5s subscription tick, so subscribers share
+// one sample per tick instead of each enumerating processes.
+const sysInfoMaxAge = 4 * time.Second
+
+var (
+	sysInfoMu   sync.Mutex
+	sysInfoLast SysInfo
+	sysInfoAt   time.Time
+)
+
+// sharedSystemInfo samples at most once per sysInfoMaxAge. It also keeps
+// gopsutil's cpu.Percent(0, …) meaningful: that measures since the previous
+// call process-wide, so interleaved per-client calls would shrink the window.
+func sharedSystemInfo() (SysInfo, error) {
+	sysInfoMu.Lock()
+	defer sysInfoMu.Unlock()
+	if !sysInfoAt.IsZero() && time.Since(sysInfoAt) < sysInfoMaxAge {
+		return sysInfoLast, nil
+	}
+	info, err := getSystemInfo()
+	if err != nil {
+		return info, err
+	}
+	sysInfoLast, sysInfoAt = info, time.Now()
+	return info, nil
+}
+
 func sendSysInfo(client *Client) bool {
-	sysInfo, err := getSystemInfo()
+	sysInfo, err := sharedSystemInfo()
 	if err != nil {
 		log.Printf("Error getting system info: %v", err)
 		return true
@@ -1565,13 +1683,34 @@ func refreshListenStatusUI() {
 		}
 		if err != nil {
 			serverStatus.Set(statusError, "Not listening")
-			bindErrorLabel.SetText(err.Error())
+			bindErrorBanner.Set(describeBindError(addr, err))
 			bindErrorBanner.Show()
 		} else {
 			serverStatus.Set(statusOK, "Listening on "+addr)
 			bindErrorBanner.Hide()
 		}
 	})
+}
+
+// describeBindError turns a listen failure into a headline and a next step the
+// user can act on, instead of the raw Go error.
+func describeBindError(addr string, err error) (string, string) {
+	port := addr
+	if _, p, splitErr := net.SplitHostPort(addr); splitErr == nil {
+		port = p
+	}
+	switch {
+	case errors.Is(err, errAddrInUse):
+		return fmt.Sprintf("Port %s is already in use", port),
+			"Another app, or another copy of Bitfocus Listener, is using this port. Close it or choose a different port below."
+	case errors.Is(err, errAddrDenied):
+		return fmt.Sprintf("Not allowed to use port %s", port),
+			"Your system blocked access to this port. Choose a port above 1024 below."
+	case errors.Is(err, errAddrNotAvail):
+		return "Network interface unavailable",
+			"The selected network interface is no longer available on this computer. Choose another interface below."
+	}
+	return "The server couldn't start", err.Error()
 }
 
 func preferredLocalIP() string {
@@ -1615,6 +1754,28 @@ func websocketTargetHost() string {
 		return "127.0.0.1"
 	}
 	return iface
+}
+
+// revealInFileManager shows path selected in Finder / Explorer, or opens its
+// folder elsewhere.
+func revealInFileManager(path string) {
+	if path == "" {
+		return
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", "-R", path)
+	case "windows":
+		cmd = exec.Command("explorer", "/select,"+path)
+	default:
+		cmd = exec.Command("xdg-open", filepath.Dir(path))
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("Failed to reveal %s: %v", path, err)
+		return
+	}
+	go func() { _ = cmd.Wait() }()
 }
 
 func openAccessibilitySettings() {
@@ -1679,10 +1840,17 @@ func restartServer(bindIP, port string, errorCallback func(err error)) {
 	go func() {
 		log.Printf("Restarting server to bind on %s:%s", bindIP, port)
 		applied, err := bindHTTPServer(bindIP, port)
-		if !applied || errorCallback == nil {
+		if !applied {
 			return
 		}
-		errorCallback(err)
+		if err != nil {
+			auditLog("gui", "SERVER_RESTART_FAILED", fmt.Sprintf("bind=%s:%s error=%v", bindIP, port, err))
+		} else {
+			auditLog("gui", "SERVER_RESTARTED", fmt.Sprintf("bind=%s:%s", bindIP, port))
+		}
+		if errorCallback != nil {
+			errorCallback(err)
+		}
 	}()
 }
 
@@ -1748,6 +1916,7 @@ func bindHTTPServer(bindIP, port string) (applied bool, err error) {
 		log.Printf("Server starting on %s", addr)
 		if serveErr := srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Printf("Server error: %v", serveErr)
+			auditLog("system", "SERVER_ERROR", fmt.Sprintf("bind=%s error=%v", addr, serveErr))
 			serverMu.Lock()
 			stillCurrent := currentServer == srv
 			serverMu.Unlock()
@@ -2469,6 +2638,9 @@ func showActivityLogDialog(parent fyne.Window) {
 			if e.Detail != "" {
 				detail = "  " + e.Detail
 			}
+			if e.Repeats > 0 {
+				detail += fmt.Sprintf("  ×%d", e.Repeats+1)
+			}
 			next = append(next, logRow{
 				meta:   e.Time.Format("Jan 2, 15:04:05") + "  ·  " + source,
 				action: e.Action,
@@ -2506,6 +2678,7 @@ func showActivityLogDialog(parent fyne.Window) {
 		logFilePath = audit.filePath
 	}
 	copyPathBtn := newCopyButton(parent.Clipboard(), func() string { return logFilePath })
+	revealBtn := newIconButton(theme.FolderOpenIcon(), func() { revealInFileManager(logFilePath) })
 	pathText := newSubtleText(logFilePath)
 	subtleStyle(pathText).TextStyle = fyne.TextStyle{Monospace: true}
 	subtleStyle(pathText).Inline = false
@@ -2513,7 +2686,7 @@ func showActivityLogDialog(parent fyne.Window) {
 
 	content := container.NewBorder(
 		copyHint,
-		container.NewBorder(nil, nil, nil, copyPathBtn, pathText),
+		container.NewBorder(nil, nil, nil, container.NewHBox(revealBtn, copyPathBtn), pathText),
 		nil, nil,
 		newCard(container.NewThemeOverride(logList, compactTheme{fyne.CurrentApp().Settings().Theme()})),
 	)
@@ -2528,6 +2701,7 @@ func showActivityLogDialog(parent fyne.Window) {
 
 func startGUI() {
 	buildMainWindow(app.New()).ShowAndRun()
+	auditLog("system", "STOPPED", "")
 }
 
 func buildMainWindow(myApp fyne.App) fyne.Window {
@@ -2557,10 +2731,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		restartServer(iface, port, nil)
 	}
 
-	bindErrorLabel = widget.NewLabel("")
-	bindErrorLabel.Importance = widget.DangerImportance
-	bindErrorLabel.Wrapping = fyne.TextWrapWord
-	bindErrorBanner = newCard(container.NewBorder(nil, nil, widget.NewIcon(theme.ErrorIcon()), nil, bindErrorLabel))
+	bindErrorBanner = newErrorBanner()
 	bindErrorBanner.Hide()
 
 	connMu.Lock()
@@ -2966,6 +3137,7 @@ func main() {
 	startHTTPServer(config.Interface, config.Port, func(err error) {
 		if err != nil {
 			log.Printf("Initial binding error: %v", err)
+			auditLog("system", "SERVER_START_FAILED", fmt.Sprintf("bind=%s:%s error=%v", config.Interface, config.Port, err))
 		}
 	})
 	startGUI()
