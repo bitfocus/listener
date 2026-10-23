@@ -1146,23 +1146,30 @@ func handleCommand(client *Client, cmd Command) {
 	// Checked only after auth so unauthenticated peers can't probe which
 	// commands are enabled or flood the audit log with BLOCKED entries.
 	if cmd.Type != "auth" && cmd.Type != "unsubscribe" {
-		gate := cmd.Type
-		if g, ok := commandGates[cmd.Type]; ok {
-			gate = g
+		gate, isHelper := commandGates[cmd.Type]
+		if !isHelper {
+			gate = cmd.Type
 		}
 		configMu.RLock()
 		allowed, exists := config.AllowedCommands[gate]
 		configMu.RUnlock()
 		if !exists || !allowed {
-			log.Printf("Command %s is disabled", cmd.Type)
-			reason := "is disabled"
-			if !exists {
-				reason = "is not a known command"
+			reason, message := "is disabled", "Command "+cmd.Type+" is disabled on the server"
+			switch {
+			case !exists && strings.HasPrefix(cmd.Type, "osx") && runtime.GOOS != "darwin":
+				reason, message = "is not a known command", "Command "+cmd.Type+" is only supported on macOS"
+			case !exists:
+				reason, message = "is not a known command", "Command "+cmd.Type+" is not supported by this version of Listener"
 			}
-			auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s %s", truncateForLog(cmd.Type, 60), reason))
+			log.Printf("Command %s %s", truncateForLog(cmd.Type, 60), reason)
+			// Clients send helper commands on their own (e.g. on every connect), so a
+			// refusal isn't something the user did and would only clutter the log.
+			if !isHelper {
+				auditLog(client.IP, "BLOCKED", fmt.Sprintf("command %s %s", truncateForLog(cmd.Type, 60), reason))
+			}
 			_ = client.writeJSON(map[string]interface{}{
 				"type":    "error",
-				"message": "Command " + cmd.Type + " is disabled on the server",
+				"message": message,
 			})
 			return
 		}

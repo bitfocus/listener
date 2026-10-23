@@ -97,6 +97,9 @@ source IP (5 attempts, then a 5 minute lockout).
 
 Every command type can be disabled individually in the GUI. A disabled command
 returns `{"type":"error","message":"Command <type> is disabled on the server"}`.
+A command this Listener doesn't have returns `…is not supported by this version
+of Listener` instead (or `…is only supported on macOS` for `osx*` commands on
+other platforms).
 
 Legacy aliases (`subscribeSysInfo`, `unsubscribeMousePosition`, …) are still
 accepted and normalized.
