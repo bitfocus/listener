@@ -46,11 +46,16 @@ equivalent to interactive access to the machine.
 2. In **Security → Allowed Remote Actions**, disable everything you do not use.
    `shellRun` and `osxAppleScript` execute arbitrary operator-supplied code and
    are the highest-value targets.
-3. In **Security → Key Access Control**, switch to *Restricted* and allow only
+3. Leave `fileWrite` off unless you need it. When it is on, it can only write
+   plain-text data files (`.txt`, `.csv`, `.json`, `.srt`, …) inside the folders listed under
+   **Security → Allowed write file paths**. Those folders can only be added in the
+   GUI. The GUI refuses your whole home folder, drive roots, system folders,
+   the Listener's own config and log folders, and autostart locations.
+4. In **Security → Key Access Control**, switch to *Restricted* and allow only
    the keys you need.
-4. Rotate the password (**Generate New**) if it may have been exposed; this
+5. Rotate the password (**Generate New**) if it may have been exposed; this
    disconnects all connected clients.
-5. Review `~/.bitfocus_listener.log` — every command, auth attempt, and settings
+6. Review `~/.bitfocus_listener.log` — every command, auth attempt, and settings
    change is recorded with source IP.
 
 ### Out of scope

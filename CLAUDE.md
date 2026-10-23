@@ -60,9 +60,10 @@ There are no tests in this project.
 
 - Auth uses MD5 challenge-response: server sends salt, client responds with `MD5(salt + password)`
 - Auth is rate-limited per client IP (reconnect-safe)
-- Command types: `keyPress`, `keyCombinationPress`, `keyDown`, `keyUp`, `keyString`, `shellRun`, `fileOpen`, `mousePositionSet`, `mousePositionGet`, `mouseClick`, `osxKeyPressProcess`, `osxAppleScript`, `subscribe` / `unsubscribe`
+- Command types: `keyPress`, `keyCombinationPress`, `keyDown`, `keyUp`, `keyString`, `shellRun`, `fileOpen`, `fileWrite`, `fileWriteRootsGet`, `mousePositionSet`, `mousePositionGet`, `mouseClick`, `osxKeyPressProcess`, `osxAppleScript`, `subscribe` / `unsubscribe`
 - All commands require authentication first; each command type can be individually enabled/disabled via `AllowedCommands`
 - Key access has two modes: `full_access` (all keys) or `restricted` (only whitelisted categories/keys)
+- `fileWrite` (in `filewrite.go`) writes only inside GUI-configured `FileWriteRoots`, which clients reference by name. It uses `os.Root` and an extension allowlist, and it is off by default even on new installs (`offByDefault`)
 - Password rotate disconnects all active clients
 
 ## Platform-Specific Behavior

@@ -118,7 +118,6 @@ type statusLevel int
 const (
 	statusIdle statusLevel = iota
 	statusOK
-	statusWarn
 	statusError
 )
 
@@ -126,8 +125,6 @@ func (l statusLevel) color() color.Color {
 	switch l {
 	case statusOK:
 		return theme.Color(theme.ColorNameSuccess)
-	case statusWarn:
-		return theme.Color(theme.ColorNameWarning)
 	case statusError:
 		return theme.Color(theme.ColorNameError)
 	}
@@ -527,6 +524,9 @@ type sheetButton struct {
 	label      string
 	importance widget.Importance
 	onTap      func()
+	// canClose, when set, runs first; returning false keeps the sheet open and
+	// skips onTap, so a form with errors doesn't lose what the user typed.
+	canClose func() bool
 }
 
 // sheet is a modal panel used instead of Fyne's dialogs, whose fixed layout
@@ -642,6 +642,9 @@ func newSheet(parent fyne.Window, title, message string, content fyne.CanvasObje
 	row := container.NewHBox(layout.NewSpacer())
 	for _, b := range buttons {
 		btn := newKeyButton(b.label, func() {
+			if b.canClose != nil && !b.canClose() {
+				return
+			}
 			s.Hide()
 			if b.onTap != nil {
 				b.onTap()

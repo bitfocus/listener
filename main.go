@@ -73,6 +73,9 @@ type Config struct {
 	KeyControlMode string          `json:"key_control_mode"` // "full_access" or "restricted"
 	AllowedKeys    map[string]bool `json:"allowed_keys"`     // Map of allowed keys
 	KeyCategories  map[string]bool `json:"key_categories"`   // Map of allowed key categories
+	// FileWriteRoots maps the folder names clients use in fileWrite to real
+	// folders. Only the local GUI can change it.
+	FileWriteRoots map[string]string `json:"file_write_roots,omitempty"`
 }
 
 var config Config
@@ -112,9 +115,16 @@ var validAppleScriptName = regexp.MustCompile(`^[a-zA-Z0-9 .\-_]+$`)
 var defaultCommands = []string{
 	"keyPress", "keyCombinationPress",
 	"keyDown", "keyUp", "osxKeyPressProcess", "osxAppleScript", "keyString", "shellRun",
-	"fileOpen", "mousePositionSet", "mousePositionGet", "mouseClick",
+	"fileOpen", "fileWrite", "mousePositionSet", "mousePositionGet", "mouseClick",
 	"subscribe",
 }
+
+// commandGates maps helper commands to the toggle that controls them, so they
+// are allowed exactly when that command is.
+var commandGates = map[string]string{"fileWriteRootsGet": "fileWrite"}
+
+// offByDefault lists commands that stay disabled even on a fresh install.
+var offByDefault = map[string]bool{"fileWrite": true}
 
 // remove defaultCommands starting with osx from non-darwin systems
 func init() {
@@ -142,10 +152,9 @@ func loadConfig() error {
 			Port:      "12001",
 			Interface: "0.0.0.0",
 		}
-		// Enable all default commands.
 		config.AllowedCommands = make(map[string]bool)
 		for _, cmd := range defaultCommands {
-			config.AllowedCommands[cmd] = true
+			config.AllowedCommands[cmd] = !offByDefault[cmd]
 		}
 		// Initialize key control with full access by default
 		config.KeyControlMode = "full_access"
@@ -165,7 +174,17 @@ func loadConfig() error {
 	if config.AllowedCommands == nil {
 		config.AllowedCommands = make(map[string]bool)
 		for _, cmd := range defaultCommands {
-			config.AllowedCommands[cmd] = true
+			config.AllowedCommands[cmd] = !offByDefault[cmd]
+		}
+	}
+	// A hand-edited config can't widen what fileWrite may write to.
+	for name, dir := range config.FileWriteRoots {
+		if !validRootName.MatchString(name) {
+			log.Printf("Ignoring file write folder %q: invalid name", name)
+			delete(config.FileWriteRoots, name)
+		} else if _, err := validateWriteRoot(dir); err != nil {
+			log.Printf("Ignoring file write folder %q: %v", name, err)
+			delete(config.FileWriteRoots, name)
 		}
 	}
 	// Initialize key control fields if missing (for backward compatibility)
@@ -558,6 +577,8 @@ type Command struct {
 	ProcessName string   `json:"processName,omitempty"`
 	Name        string   `json:"name,omitempty"` // For subscribe/unsubscribe events.
 	Password    string   `json:"password,omitempty"`
+	Root        string   `json:"root,omitempty"`    // fileWrite folder name
+	Newline     string   `json:"newline,omitempty"` // fileWrite: lf, crlf or none
 }
 
 type Client struct {
@@ -731,6 +752,8 @@ func logCommand(cmd Command) {
 		log.Printf("Received command: type=keyString chars=%d", utf8.RuneCountInString(cmd.Msg))
 	case "osxAppleScript":
 		log.Printf("Received command: type=%s msg=%q", cmd.Type, truncateForLog(cmd.Msg, 80))
+	case "fileWrite":
+		log.Printf("Received command: type=fileWrite root=%q path=%q bytes=%d", truncateForLog(cmd.Root, 40), truncateForLog(cmd.Path, 120), len(cmd.Msg))
 	default:
 		log.Printf("Received command: type=%s key=%q name=%q", cmd.Type, cmd.Key, cmd.Name)
 	}
@@ -1123,8 +1146,12 @@ func handleCommand(client *Client, cmd Command) {
 	// Checked only after auth so unauthenticated peers can't probe which
 	// commands are enabled or flood the audit log with BLOCKED entries.
 	if cmd.Type != "auth" && cmd.Type != "unsubscribe" {
+		gate := cmd.Type
+		if g, ok := commandGates[cmd.Type]; ok {
+			gate = g
+		}
 		configMu.RLock()
-		allowed, exists := config.AllowedCommands[cmd.Type]
+		allowed, exists := config.AllowedCommands[gate]
 		configMu.RUnlock()
 		if !exists || !allowed {
 			log.Printf("Command %s is disabled", cmd.Type)
@@ -1437,6 +1464,24 @@ func handleCommand(client *Client, cmd Command) {
 		}
 		log.Printf("Opened file: %s", target)
 
+	case "fileWrite":
+		rootName, written, n, err := writeToFile(cmd.Root, cmd.Path, cmd.Msg, cmd.Newline)
+		if err != nil {
+			log.Printf("fileWrite failed: %v", err)
+			action := "COMMAND_FAILED"
+			var rej *writeRejection
+			if errors.As(err, &rej) {
+				action = "BLOCKED"
+			}
+			auditLog(client.IP, action, fmt.Sprintf("fileWrite root=%s path=%s: %v", truncateForLog(rootName, 40), truncateForLog(cmd.Path, 120), err))
+			_ = client.writeJSON(map[string]interface{}{
+				"type":    "error",
+				"message": "fileWrite: " + err.Error(),
+			})
+			return
+		}
+		auditLog(client.IP, "fileWrite", fmt.Sprintf("root=%s path=%s bytes=%d", truncateForLog(rootName, 40), truncateForLog(written, 120), n))
+
 	case "mousePositionSet":
 		x, err1 := strconv.Atoi(cmd.X)
 		y, err2 := strconv.Atoi(cmd.Y)
@@ -1447,6 +1492,9 @@ func handleCommand(client *Client, cmd Command) {
 		} else {
 			log.Println("Invalid mouse coordinates")
 		}
+
+	case "fileWriteRootsGet":
+		_ = client.writeJSON(fileWriteRootsMessage("fileWriteRootsGetResponse"))
 
 	case "mousePositionGet":
 		// Read-only and usually polled, so not audited.
@@ -1989,6 +2037,7 @@ var commandDescriptions = map[string]string{
 	"keyString":           "Type Text String",
 	"shellRun":            "Run Shell Command",
 	"fileOpen":            "Open File",
+	"fileWrite":           "Create / Write File",
 	"mousePositionSet":    "Set Mouse Position",
 	"mousePositionGet":    "Get Mouse Position",
 	"mouseClick":          "Mouse Click",
@@ -2003,7 +2052,7 @@ var commandGroups = []struct {
 }{
 	{"Keyboard", []string{"keyPress", "keyCombinationPress", "keyDown", "keyUp", "keyString"}},
 	{"Mouse", []string{"mouseClick", "mousePositionSet", "mousePositionGet"}},
-	{"System", []string{"shellRun", "fileOpen", "subscribe"}},
+	{"System", []string{"shellRun", "fileOpen", "fileWrite", "subscribe"}},
 	{"macOS", []string{"osxKeyPressProcess", "osxAppleScript"}},
 }
 
@@ -2908,7 +2957,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		}
 	}
 
-	actionsStatus := newStatusIndicator(statusOK, "")
+	actionsStatus := widget.NewLabel("")
 	updateRemoteActionsStatus := func() {
 		configMu.RLock()
 		enabled, total := 0, len(defaultCommands)
@@ -2920,16 +2969,20 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		configMu.RUnlock()
 		switch {
 		case enabled == 0:
-			actionsStatus.Set(statusError, "None allowed")
+			actionsStatus.SetText("None enabled")
 		case enabled == total:
-			actionsStatus.Set(statusOK, fmt.Sprintf("All %d enabled", total))
+			actionsStatus.SetText(fmt.Sprintf("All %d enabled", total))
 		default:
-			actionsStatus.Set(statusWarn, fmt.Sprintf("%d of %d enabled", enabled, total))
+			actionsStatus.SetText(fmt.Sprintf("%d of %d enabled", enabled, total))
 		}
 	}
 	updateRemoteActionsStatus()
 
-	keyAccessStatus := newStatusIndicator(statusOK, "")
+	foldersStatus := widget.NewLabel("")
+	updateFoldersStatus := func() { foldersStatus.SetText(fileFoldersStatus()) }
+	updateFoldersStatus()
+
+	keyAccessStatus := widget.NewLabel("")
 	updateKeyControlStatus := func() {
 		configMu.RLock()
 		mode := config.KeyControlMode
@@ -2947,11 +3000,11 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		configMu.RUnlock()
 		switch {
 		case mode == "full_access":
-			keyAccessStatus.Set(statusOK, "All keys")
+			keyAccessStatus.SetText("All keys")
 		case nCats == 0 && nKeys == 0:
-			keyAccessStatus.Set(statusError, "No keys allowed")
+			keyAccessStatus.SetText("No keys")
 		default:
-			keyAccessStatus.Set(statusWarn, plural(nCats, "category", "categories")+", "+plural(nKeys, "key", "keys"))
+			keyAccessStatus.SetText(plural(nCats, "category", "categories") + ", " + plural(nKeys, "key", "keys"))
 		}
 	}
 	updateKeyControlStatus()
@@ -3029,7 +3082,15 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 
 	securitySection := newSection("Security",
 		newTapRow("Remote actions", actionsStatus, nil, func() {
-			showAllowedCommandsDialog(w, updateRemoteActionsStatus)
+			showAllowedCommandsDialog(w, func() {
+				updateRemoteActionsStatus()
+				// fileWrite may have just been turned on.
+				broadcastFileWriteRoots()
+			})
+		}),
+		widget.NewSeparator(),
+		newTapRow("Allowed write file paths", foldersStatus, nil, func() {
+			showFileFoldersDialog(w, updateFoldersStatus)
 		}),
 		widget.NewSeparator(),
 		newTapRow("Key access", keyAccessStatus, nil, func() {

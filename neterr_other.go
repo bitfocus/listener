@@ -9,3 +9,6 @@ var (
 	errAddrDenied   error = syscall.EACCES
 	errAddrNotAvail error = syscall.EADDRNOTAVAIL
 )
+
+// errFileInUse is nil here: only Windows locks files that other programs have open.
+var errFileInUse error
