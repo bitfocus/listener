@@ -192,12 +192,16 @@ jobs:
 
   win32-x64:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository }}
-    # Signed Windows builds need the Bitfocus code-signing token, which only
-    # exists on the self-hosted 'codecert' runner, so it is reserved for tags and
-    # opted in pushes. Everything else (forks, pull requests, ordinary pushes)
-    # builds unsigned on a GitHub-hosted runner.
-    runs-on: ${{ (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '[build-signed]'))) && fromJSON('["self-hosted", "Windows", "codecert", "X64"]') || 'windows-latest' }}
+    runs-on: windows-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Sign the builds that are kept (main and release tags), or a push whose
+      # head commit message contains [build-signed]. Forks and Dependabot runs
+      # cannot get the signing secrets.
+      SIGN_BUILD: ${{ github.repository == 'bitfocus/listener' && github.actor != 'dependabot[bot]' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '[build-signed]')) }}
 
     steps:
       - uses: actions/checkout@v7
@@ -208,23 +212,6 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-
-      # cgo needs gcc. windows-latest ships MinGW, but the self-hosted runner is
-      # bare, so fetch the MSYS2 project's own toolchain. It is extracted into
-      # RUNNER_TEMP, so nothing is left behind on the runner after the job.
-      - name: Setup MinGW (self-hosted)
-        id: msys2
-        if: ${{ runner.environment == 'self-hosted' }}
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: false
-          install: mingw-w64-x86_64-gcc
-      - name: Add MinGW to PATH (self-hosted)
-        if: ${{ runner.environment == 'self-hosted' }}
-        shell: pwsh
-        run: |
-          "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin" >> $env:GITHUB_PATH
 
       - name: Check version matches tag
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -239,21 +226,31 @@ jobs:
           CGO_ENABLED: '1'
         run: tools/build.sh windows X64
 
-      - name: sign executables
-        if: ${{ runner.environment == 'self-hosted' }}
+      - name: Setup code signing
+        id: codesign
+        if: ${{ env.SIGN_BUILD == 'true' }}
+        uses: bitfocus/actions/setup-windows-codesign@main
+        with:
+          workload-identity-provider: ${{ secrets.WINDOWS_CODESIGN_WIF_PROVIDER }}
+          service-account: ${{ secrets.WINDOWS_CODESIGN_SERVICE_ACCOUNT }}
+          kms-keyring: ${{ secrets.WINDOWS_CODESIGN_KMS_KEYRING }}
+          kms-key: ${{ secrets.WINDOWS_CODESIGN_KMS_KEY }}
+          certificate: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+
+      # The shared signing script also verifies each signature after signing.
+      - name: Sign executables
+        if: ${{ env.SIGN_BUILD == 'true' }}
         shell: pwsh
         env:
-          CSC_LINK: c:\actions-runner-bitfocusas\codesign.cer
-          BF_CODECERT_KEY: ${{ secrets.BF_CODECERT_KEY }}
+          BF_CODESIGN_ACCESS_TOKEN: ${{ steps.codesign.outputs.access-token }}
         run: |
+          $ErrorActionPreference = 'Stop'
           Get-ChildItem -Path "./build" -Filter *.exe | ForEach-Object {
-            .\tools\sign.ps1 $_.FullName -Description "Bitfocus Listener"
+            & $env:BF_CODESIGN_SCRIPT $_.FullName -Description "Bitfocus Listener"
           }
 
       - name: Determine files to upload
         id: filenames
-        # Compress-Archive is used rather than zip/7z, as it is the only zip tool
-        # guaranteed to be present on both the hosted and self-hosted runners.
         shell: pwsh
         run: |
           Rename-Item build bitfocus-listener

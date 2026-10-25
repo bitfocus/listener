@@ -78,7 +78,7 @@ Follows the same shape as the other Bitfocus open source repos (see `bitfocus/co
 
 - **lint.yaml**: `[push, pull_request]` on `ubuntu-latest` — gofmt + `go vet`
 - **build.yaml**: `[push, pull_request]` — builds macOS ARM64/X64 on GitHub-hosted `macos-26` and Windows X64 on `windows-latest`
-- Signing is opportunistic: macOS signs only when `CSC_LINK` is present, Windows signs only on the self-hosted `codecert` runner (selected via `runs-on` when the ref is a tag or the commit message contains `[build-signed]`)
+- Signing is opportunistic: macOS signs only when `CSC_LINK` is present, Windows signs on the GitHub-hosted runner via `bitfocus/actions/setup-windows-codesign` (Google Cloud KMS key, OIDC auth) for `main` pushes, tags, or a commit message containing `[build-signed]`; never for forks or Dependabot
 - Upload steps are guarded by `github.repository_owner == 'bitfocus'`, so forks build but never publish
 - Beta = push to `main`, stable = `v*` tag; both publish to the AWS bucket via `bitfocus/actions/upload-and-notify-for-branch@main` using `RELEASE_S3_*`. Stable lands at `<RELEASE_S3_BASEPATH>/`, beta at `<RELEASE_S3_BASEPATH>/beta/`
 - `tools/check-tag-version.sh` enforces that a `v*` tag matches `version.json`
