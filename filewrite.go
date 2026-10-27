@@ -224,7 +224,7 @@ func validateWriteRoot(dir string) (string, error) {
 		return "", errors.New("no folder chosen")
 	}
 	resolved := resolveDir(dir)
-	if filepath.Dir(resolved) == resolved {
+	if isDriveRoot(resolved) {
 		return "", errors.New("For security, Listener can't write to a whole drive. Choose a folder on it instead.")
 	}
 	for _, p := range protectedDirs() {
@@ -252,6 +252,18 @@ func validateWriteRoot(dir string) (string, error) {
 		}
 	}
 	return resolved, nil
+}
+
+// isDriveRoot reports whether dir is the top of a drive. On macOS other drives
+// mount at /Volumes/<name>, so those (and /Volumes itself) count as well as "/".
+func isDriveRoot(dir string) bool {
+	if filepath.Dir(dir) == dir {
+		return true
+	}
+	if runtime.GOOS == "darwin" {
+		return strings.EqualFold(dir, "/Volumes") || strings.EqualFold(filepath.Dir(dir), "/Volumes")
+	}
+	return false
 }
 
 // displayPath shortens paths under the home folder to "~/...". Windows users
@@ -359,15 +371,17 @@ func writeInRoot(rootName, dir, rel, msg, newline string) (string, int, error) {
 		return "", 0, err
 	}
 	// Re-checked on every write: the folder may have been replaced by a symlink
-	// since it was added.
-	if _, err := validateWriteRoot(dir); err != nil {
+	// since it was added. The resolved path is what gets opened, so a symlink
+	// swapped in after this check isn't followed.
+	resolved, err := validateWriteRoot(dir)
+	if err != nil {
 		return clean, 0, rejectf("folder %q is no longer allowed. Check Allowed Write File Paths on the Listener", rootName)
 	}
 
 	fileWriteMu.Lock()
 	defer fileWriteMu.Unlock()
 
-	root, err := os.OpenRoot(dir)
+	root, err := os.OpenRoot(resolved)
 	if err != nil {
 		return clean, 0, fmt.Errorf("folder %q is not available: %w", rootName, describeFileErr(err))
 	}
