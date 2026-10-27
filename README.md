@@ -89,15 +89,60 @@ source IP (5 attempts, then a 5 minute lockout).
 | `mouseClick` | `button`, `double` | `button`: `left`, `right`, `center`; `double`: `"true"` |
 | `shellRun` | `shell` | Arbitrary shell command, 60 s timeout |
 | `fileOpen` | `path` | Opens with the system handler |
+| `fileWrite` | `root`, `path`, `msg`, `newline` | Creates a file or adds `msg` to the end of one inside an allowed folder; see below |
+| `fileWriteRootsGet` | — | Replies `fileWriteRootsGetResponse` with the folder names; see below |
 | `osxKeyPressProcess` | `processName`, `key`, `modifiers[]` | macOS: activate an app, then send the key |
 | `osxAppleScript` | `msg` | macOS: arbitrary AppleScript |
 | `subscribe` / `unsubscribe` | `name` | `mousePosition` (1 s) or `sysInfo` (5 s) |
 
 Every command type can be disabled individually in the GUI. A disabled command
 returns `{"type":"error","message":"Command <type> is disabled on the server"}`.
+A command this Listener doesn't have returns `…is not supported by this version
+of Listener` instead (or `…is only supported on macOS` for `osx*` commands on
+other platforms).
 
 Legacy aliases (`subscribeSysInfo`, `unsubscribeMousePosition`, …) are still
 accepted and normalized.
+
+### Writing to files
+
+`fileWrite` is off by default, and it only writes inside folders added under
+**Security → Allowed write file paths**. Each folder gets a short name, and clients
+pick a folder by that name, never by path:
+
+```json
+{ "type": "fileWrite", "root": "logs", "path": "2026/show.csv", "msg": "cue 12,14:03:11", "newline": "lf" }
+```
+
+- `root` is a folder name. It can be left out when only one folder is set up.
+- `path` is relative to the folder. Missing subfolders are created. `..` and
+  absolute paths are rejected, and so are symlinks that lead outside the folder.
+- `<>:"|?*` in `path` are replaced with `-` on every platform, so
+  `$(internal:time_hms)` makes the same file name on macOS and Windows.
+  Windows device names (`CON`, `NUL`, `COM1`, …) are rejected.
+- Only `.csv .edl .json .jsonl .log .md .ndjson .srt .tsv .txt .vtt .xml .yaml .yml`
+  files can be written. Text is appended as UTF-8 and existing content is
+  never overwritten.
+- `newline` is `lf` (the default), `crlf` or `none`. Use `none` with an empty
+  `msg` to just create the file.
+- Each write may be up to 64 KB, and a file stops growing at 50 MB.
+- Text is written exactly as sent. Spreadsheet formulas in `.csv` content are
+  not escaped.
+
+To fill a folder picker, send `{"type":"fileWriteRootsGet"}`. The reply lists
+folder names and allowed file types, never the real paths:
+
+```json
+{ "type": "fileWriteRootsGetResponse", "roots": ["cues", "logs"], "extensions": [".csv", ".txt", "…"] }
+```
+
+When the folders change, or `fileWrite` is turned on, every authenticated
+client receives the same message as `fileWriteRootsChanged`. Both are only
+available while `fileWrite` is enabled.
+
+Failures come back as `{"type":"error","message":"fileWrite: …"}`. For
+example, the folder name may be unknown, or on Windows another program such as
+Excel may have the file open.
 
 ### Key names
 

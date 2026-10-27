@@ -8,3 +8,7 @@ var (
 	errAddrDenied   error = syscall.Errno(10013) // WSAEACCES
 	errAddrNotAvail error = syscall.Errno(10049) // WSAEADDRNOTAVAIL
 )
+
+// errFileInUse is ERROR_SHARING_VIOLATION, returned when another program
+// (typically Excel) holds the file open.
+var errFileInUse error = syscall.Errno(32)
