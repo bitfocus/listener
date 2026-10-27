@@ -757,6 +757,17 @@ func (t readableDisabledTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant)
 	return t.Theme.Color(n, v)
 }
 
+// mutedLinkTheme draws hyperlinks in the secondary text colour, for links that
+// sit inside subtle text such as the footer. They still underline on hover.
+type mutedLinkTheme struct{ fyne.Theme }
+
+func (t mutedLinkTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if n == theme.ColorNameHyperlink {
+		return t.Theme.Color(theme.ColorNamePlaceHolder, v)
+	}
+	return t.Theme.Color(n, v)
+}
+
 // digitEntry is an Entry that only accepts digits, up to maxLen of them.
 // Pasted text is filtered to its digits. OnFocusLost lets callers repair an
 // incomplete value when the user moves on.

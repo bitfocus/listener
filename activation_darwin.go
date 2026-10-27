@@ -77,6 +77,10 @@ void unifyTitlebar(uintptr_t ptr, double dragHeight) {
 			[toolbar release];
 			win.toolbarStyle = NSWindowToolbarStyleUnified;
 		}
+		// GLFW opts the window into full screen; a settings window has no use for
+		// it, and the green button then zooms instead.
+		win.collectionBehavior = (win.collectionBehavior & ~NSWindowCollectionBehaviorFullScreenPrimary) |
+			NSWindowCollectionBehaviorFullScreenNone;
 		win.titleVisibility = NSWindowTitleHidden;
 		win.titlebarAppearsTransparent = YES;
 		win.styleMask |= NSWindowStyleMaskFullSizeContentView;
