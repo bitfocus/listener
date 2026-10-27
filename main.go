@@ -123,8 +123,9 @@ var defaultCommands = []string{
 // are allowed exactly when that command is.
 var commandGates = map[string]string{"fileWriteRootsGet": "fileWrite"}
 
-// offByDefault lists commands that stay disabled even on a fresh install.
-var offByDefault = map[string]bool{"fileWrite": true}
+// offByDefault lists commands that stay disabled even on a fresh install: the
+// ones that can run arbitrary code or launch programs, and fileWrite.
+var offByDefault = map[string]bool{"shellRun": true, "osxAppleScript": true, "fileOpen": true, "fileWrite": true}
 
 // remove defaultCommands starting with osx from non-darwin systems
 func init() {

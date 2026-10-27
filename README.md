@@ -11,8 +11,9 @@ It was built by [Bitfocus AS](https://bitfocus.io) to remote control machines fr
 released under the MIT License.
 
 > [!WARNING]
-> Listener grants remote control of the machine it runs on. With `shellRun` or
-> `osxAppleScript` enabled, an authenticated client can execute arbitrary code.
+> Listener grants remote control of the machine it runs on. With `shellRun`,
+> `osxAppleScript` or `fileOpen` enabled, an authenticated client can execute
+> arbitrary code or launch programs. All three are off on new installs.
 > Traffic is unencrypted and authentication is MD5 challenge-response. Read
 > [SECURITY.md](SECURITY.md) before exposing it to any network you do not fully
 > control.
@@ -95,7 +96,10 @@ source IP (5 attempts, then a 5 minute lockout).
 | `osxAppleScript` | `msg` | macOS: arbitrary AppleScript |
 | `subscribe` / `unsubscribe` | `name` | `mousePosition` (1 s) or `sysInfo` (5 s) |
 
-Every command type can be disabled individually in the GUI. A disabled command
+Every command type can be enabled or disabled individually in the GUI under
+**Security → Allowed Remote Actions**. On a new install `shellRun`,
+`osxAppleScript`, `fileOpen` and `fileWrite` start off; upgrading keeps whatever
+an existing config already allows. A disabled command
 returns `{"type":"error","message":"Command <type> is disabled on the server"}`.
 A command this Listener doesn't have returns `…is not supported by this version
 of Listener` instead (or `…is only supported on macOS` for `osx*` commands on

@@ -44,8 +44,10 @@ equivalent to interactive access to the machine.
 
 1. Bind to `127.0.0.1` if only local clients need access.
 2. In **Security → Allowed Remote Actions**, disable everything you do not use.
-   `shellRun` and `osxAppleScript` execute arbitrary operator-supplied code and
-   are the highest-value targets.
+   `shellRun` and `osxAppleScript` execute arbitrary operator-supplied code, and
+   `fileOpen` can launch any program or script by path. They are the
+   highest-value targets and are off on new installs; configs from earlier
+   versions keep their existing settings.
 3. Leave `fileWrite` off unless you need it. When it is on, it can only write
    plain-text data files (`.txt`, `.csv`, `.json`, `.srt`, …) inside the folders listed under
    **Security → Allowed write file paths**. Those folders can only be added in the
