@@ -3143,9 +3143,21 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 			copyrightYear = y
 		}
 	}
-	footerText := newSubtleText(fmt.Sprintf("Bitfocus AS © %d  ·  %s\n%s", copyrightYear, HumanVersion, trayHint))
+	footerText := newSubtleText(fmt.Sprintf("Bitfocus AS © %d  ·  %s  ·  ", copyrightYear, HumanVersion))
 	subtleStyle(footerText).Alignment = fyne.TextAlignCenter
-	subtleStyle(footerText).Inline = false
+	issuesURL, _ := url.Parse("https://github.com/bitfocus/listener/issues")
+	hintStyle := *subtleStyle(footerText)
+	hintStyle.Inline = false
+	footerText.Segments = append(footerText.Segments,
+		&widget.HyperlinkSegment{
+			Text:      "Report an Issue",
+			URL:       issuesURL,
+			Alignment: fyne.TextAlignCenter,
+			SizeName:  theme.SizeNameCaptionText,
+		},
+		// The leading newline puts the hint on its own line under the link.
+		&widget.TextSegment{Text: "\n" + trayHint, Style: hintStyle},
+	)
 
 	page := container.NewVBox(bindErrorBanner, statusSection, connectionSection, securitySection, generalSection)
 	margin := 2 * theme.Padding()
@@ -3188,7 +3200,8 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 	// Growing the window clamps the offset back to 0 without OnScrolled, so
 	// re-check after every layout too.
 	scrollArea := container.New(fillThenLayout{after: syncDivider}, scroll)
-	footer := container.New(layout.NewCustomPaddedLayout(0, margin, margin, margin), footerText)
+	footer := container.New(layout.NewCustomPaddedLayout(0, margin, margin, margin),
+		container.NewThemeOverride(footerText, mutedLinkTheme{fyne.CurrentApp().Settings().Theme()}))
 	w.SetPadded(false)
 	w.SetContent(container.NewBorder(top, footer, nil, nil, scrollArea))
 	// The scroll has no useful min height, so open tall enough to show every
