@@ -2815,25 +2815,32 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		if deskApp == nil {
 			return
 		}
+		// The menu's own title isn't shown in a tray menu, so the name is a
+		// disabled first item.
+		titleItem := fyne.NewMenuItem("Bitfocus Listener "+HumanVersion, nil)
+		titleItem.Disabled = true
 		statusItem := fyne.NewMenuItem(status, nil)
 		statusItem.Disabled = true
-		quitItem := fyne.NewMenuItem("Quit", func() { myApp.Quit() })
+		quitItem := fyne.NewMenuItem("Quit Bitfocus Listener", func() { myApp.Quit() })
 		quitItem.IsQuit = true
 		deskApp.SetSystemTrayMenu(fyne.NewMenu("Bitfocus Listener",
+			titleItem,
 			statusItem,
-			fyne.NewMenuItem("Open Settings", func() {
+			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Open Settings…", func() {
 				w.Show()
 				w.RequestFocus()
 			}),
-			fyne.NewMenuItem("Restart Server", restartWithCurrentBind),
-			fyne.NewMenuItem("Copy Target Host", func() {
-				w.Clipboard().SetContent(websocketTargetHost())
-			}),
-			fyne.NewMenuItem("Activity Log", func() {
+			fyne.NewMenuItem("Activity Log…", func() {
 				w.Show()
 				w.RequestFocus()
 				showActivityLogDialog(w)
 			}),
+			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Copy Target Host", func() {
+				w.Clipboard().SetContent(websocketTargetHost())
+			}),
+			fyne.NewMenuItem("Restart Server", restartWithCurrentBind),
 			fyne.NewMenuItemSeparator(),
 			quitItem,
 		))
