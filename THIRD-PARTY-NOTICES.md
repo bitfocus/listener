@@ -6,11 +6,15 @@ license.
 
 ## Bundled binaries
 
-### Mesa 3D Graphics Library (`tools/extras/opengl32.dll`)
+### Mesa 3D Graphics Library (`tools/extras/opengl32.dll`, `tools/extras/win-arm64/opengl32.dll`)
 
-Windows builds ship a software OpenGL implementation so the Fyne GUI renders on
-machines without a usable hardware OpenGL driver. The binary is the Mesa3D
-Windows build from <https://fdossena.com/?p=mesa/index.frag>.
+Windows builds ship a software OpenGL implementation so the Fyne GUI can open on
+machines without a usable hardware OpenGL driver. The x64 binary is the
+Mesa3D Windows build from <https://fdossena.com/?p=mesa/index.frag>. The
+arm64 binary is Mesa 26.2.5's llvmpipe software renderer (`opengl32.dll` from
+`mesa-llvmpipe-arm64-26.2.5.7z`) built by
+<https://github.com/mmozeiko/build-mesa/releases/tag/26.2.5>. Fyne's
+windows/arm64 build requests OpenGL ES, which that DLL provides through WGL.
 
     Copyright (C) 1999-2007  Brian Paul   All Rights Reserved.
 
