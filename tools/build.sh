@@ -117,7 +117,11 @@ if [ "$PLATFORM" = "windows" ]; then
 	go run github.com/bitfocus/syso/cmd/syso@latest -arch $GOARCH >"$BUILDLOG" 2>&1 || error "Error generating resource file for golang application ${PROGRAM}: $(cat "$BUILDLOG")"
 
 	log "Copying dynamic libraries and licenses"
-	cp "$__DIRNAME"/extras/opengl32* "$PRODUCTION_FOLDER/"
+	# The bundled Mesa opengl32.dll is x64 only; an arm64 process cannot load it,
+	# so the arm64 build relies on the system OpenGL instead.
+	if [ "$GOARCH" = "amd64" ]; then
+		cp "$__DIRNAME"/extras/opengl32* "$PRODUCTION_FOLDER/"
+	fi
 	cp "$__DIRNAME"/../LICENSE "$PRODUCTION_FOLDER/LICENSE.txt"
 	cp "$__DIRNAME"/../THIRD-PARTY-NOTICES.md "$PRODUCTION_FOLDER/"
 fi
