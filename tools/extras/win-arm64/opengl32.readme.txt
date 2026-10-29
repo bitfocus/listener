@@ -1,0 +1,12 @@
+MESA3D FOR WINDOWS ARM64 (llvmpipe) -- https://github.com/mmozeiko/build-mesa/releases/tag/26.2.5
+
+opengl32.dll from mesa-llvmpipe-arm64-26.2.5.7z (Mesa 26.2.5).
+sha256: e2ae12869b428c00f733ff17907785ddaab8d5e4076d08294098fc9e7cd3778a
+
+Place this file in the same directory as the executable. It provides OpenGL
+and OpenGL ES through WGL, rendered in software by llvmpipe, so it needs no
+GPU driver or Direct3D runtime.
+
+Fyne's windows/arm64 build asks for an OpenGL ES 2.0 context. Windows does
+not expose that through WGL, so without this DLL the settings window is never
+created. The tray icon still appears, and Open Settings does nothing.

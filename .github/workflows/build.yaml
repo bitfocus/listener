@@ -300,3 +300,129 @@ jobs:
           api-product: ${{ env.API_PRODUCT }}
           api-target: "win-x64"
           api-secret: ${{ secrets.BITFOCUS_API_PROJECT_SECRET }}
+
+  win32-arm64:
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Sign the builds that are kept (main and release tags), or a push whose
+      # head commit message contains [build-signed]. Forks and Dependabot runs
+      # cannot get the signing secrets.
+      SIGN_BUILD: ${{ github.repository == 'bitfocus/listener' && github.actor != 'dependabot[bot]' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '[build-signed]')) }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check version matches tag
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        run: tools/check-tag-version.sh
+
+      # The image's gcc is x64 only and its LLVM targets MSVC, so CGO needs a
+      # mingw toolchain that can produce arm64 binaries.
+      - name: Install llvm-mingw
+        shell: pwsh
+        env:
+          LLVM_MINGW_VERSION: '20261006'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "llvm-mingw-$env:LLVM_MINGW_VERSION-ucrt-aarch64"
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/$env:LLVM_MINGW_VERSION/$name.zip" -OutFile "$env:RUNNER_TEMP/$name.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP/$name.zip" -DestinationPath $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\$name\bin" >> $env:GITHUB_PATH
+
+      - name: build & package
+        id: build
+        shell: bash
+        env:
+          BRANCH: ${{ startsWith(github.ref, 'refs/tags/') && 'stable' || '' }}
+          CGO_ENABLED: '1'
+          CC: aarch64-w64-mingw32-clang
+          CXX: aarch64-w64-mingw32-clang++
+        run: tools/build.sh windows ARM64
+
+      - name: Setup code signing
+        id: codesign
+        if: ${{ env.SIGN_BUILD == 'true' }}
+        uses: bitfocus/actions/setup-windows-codesign@main
+        with:
+          workload-identity-provider: ${{ secrets.WINDOWS_CODESIGN_WIF_PROVIDER }}
+          service-account: ${{ secrets.WINDOWS_CODESIGN_SERVICE_ACCOUNT }}
+          kms-keyring: ${{ secrets.WINDOWS_CODESIGN_KMS_KEYRING }}
+          kms-key: ${{ secrets.WINDOWS_CODESIGN_KMS_KEY }}
+          certificate: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+
+      # The shared signing script also verifies each signature after signing.
+      - name: Sign executables
+        if: ${{ env.SIGN_BUILD == 'true' }}
+        shell: pwsh
+        env:
+          BF_CODESIGN_ACCESS_TOKEN: ${{ steps.codesign.outputs.access-token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem -Path "./build" -Filter *.exe | ForEach-Object {
+            & $env:BF_CODESIGN_SCRIPT $_.FullName -Description "Bitfocus Listener"
+          }
+
+      - name: Determine files to upload
+        id: filenames
+        shell: pwsh
+        run: |
+          Rename-Item build bitfocus-listener
+          Compress-Archive -Path bitfocus-listener -DestinationPath "${{ steps.build.outputs.OUTPUT_FILENAME }}"
+          "sourcename=${{ steps.build.outputs.OUTPUT_FILENAME }}" >> $env:GITHUB_OUTPUT
+          "targetname=${{ steps.build.outputs.OUTPUT_FILENAME }}" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: ${{ steps.filenames.outputs.sourcename }}
+          retention-days: 1
+      - name: Upload build (beta)
+        uses: bitfocus/actions/upload-and-notify-for-branch@main
+        if: ${{ github.repository_owner == 'bitfocus' && github.ref == 'refs/heads/main' }}
+        with:
+          source-filename: ${{ steps.filenames.outputs.sourcename }}
+          destination-filename: ${{ steps.filenames.outputs.targetname }}
+          s3-host: ${{ vars.RELEASE_S3_HOST }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}/beta
+          s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
+          s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
+
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}/beta
+
+          api-version: ${{ steps.build.outputs.VERSION }}
+          api-branch: "beta"
+          api-product: ${{ env.API_PRODUCT }}
+          api-target: "win-arm64"
+          api-secret: ${{ secrets.BITFOCUS_API_PROJECT_SECRET }}
+      - name: Upload build (stable)
+        uses: bitfocus/actions/upload-and-notify-for-branch@main
+        if: ${{ github.repository_owner == 'bitfocus' && startsWith(github.ref, 'refs/tags/') }}
+        with:
+          source-filename: ${{ steps.filenames.outputs.sourcename }}
+          destination-filename: ${{ steps.filenames.outputs.targetname }}
+          s3-host: ${{ vars.RELEASE_S3_HOST }}
+          s3-bucket: ${{ vars.RELEASE_S3_BASEPATH }}
+          s3-access-key: ${{ secrets.RELEASE_S3_KEY }}
+          s3-secret-key: ${{ secrets.RELEASE_S3_SECRET }}
+
+          public-bucket-url: ${{ vars.RELEASE_S3_URL }}
+
+          api-version: ${{ github.ref_name }}
+          api-branch: "stable"
+          api-product: ${{ env.API_PRODUCT }}
+          api-target: "win-arm64"
+          api-secret: ${{ secrets.BITFOCUS_API_PROJECT_SECRET }}

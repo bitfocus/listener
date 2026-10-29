@@ -113,11 +113,24 @@ if [ "$PLATFORM" = "windows" ]; then
 		tools/extras/syso/syso.json >syso.json
 	cp tools/extras/syso/manifest.xml manifest.xml
 	# go run avoids depending on GOBIN being on PATH, which differs between the
-	# macOS, Linux and Windows runners.
-	go run github.com/bitfocus/syso/cmd/syso@latest -arch $GOARCH >"$BUILDLOG" 2>&1 || error "Error generating resource file for golang application ${PROGRAM}: $(cat "$BUILDLOG")"
+	# macOS, Linux and Windows runners. GOOS/GOARCH are cleared so the tool
+	# builds for the host when cross-compiling.
+	GOOS= GOARCH= CGO_ENABLED=0 go run github.com/bitfocus/syso/cmd/syso@latest -arch $GOARCH >"$BUILDLOG" 2>&1 || error "Error generating resource file for golang application ${PROGRAM}: $(cat "$BUILDLOG")"
 
 	log "Copying dynamic libraries and licenses"
-	cp "$__DIRNAME"/extras/opengl32* "$PRODUCTION_FOLDER/"
+	# windows/arm64 Fyne asks for OpenGL ES over WGL, which Windows does not
+	# provide, so the window is never created. The Mesa DLL implements that
+	# path. The x64 DLL cannot be loaded by an arm64 process.
+	case "$GOARCH" in
+		amd64)
+			cp "$__DIRNAME"/extras/opengl32.dll "$PRODUCTION_FOLDER/"
+			cp "$__DIRNAME"/extras/opengl32.readme.txt "$PRODUCTION_FOLDER/"
+			;;
+		arm64)
+			cp "$__DIRNAME"/extras/win-arm64/opengl32.dll "$PRODUCTION_FOLDER/"
+			cp "$__DIRNAME"/extras/win-arm64/opengl32.readme.txt "$PRODUCTION_FOLDER/"
+			;;
+	esac
 	cp "$__DIRNAME"/../LICENSE "$PRODUCTION_FOLDER/LICENSE.txt"
 	cp "$__DIRNAME"/../THIRD-PARTY-NOTICES.md "$PRODUCTION_FOLDER/"
 fi
