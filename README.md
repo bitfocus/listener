@@ -223,8 +223,11 @@ hand. `version.json` holds the version number, and production tags must match it
   when called from WebSocket goroutines. The app uses `LSUIElement` and sets the
   accessory activation policy so it stays out of the Dock.
 - **Windows** — shell commands run through `cmd.exe` with the console window
-  hidden; files open via `rundll32 url.dll,FileProtocolHandler`. Builds bundle
-  a Mesa3D `opengl32.dll` for machines without a usable OpenGL driver.
+  hidden; files open via `rundll32 url.dll,FileProtocolHandler`. Both
+  architectures bundle a Mesa3D `opengl32.dll` so the settings window can
+  open without a hardware OpenGL driver. The arm64 DLL is Mesa's llvmpipe
+  software renderer: Fyne asks Windows on ARM for OpenGL ES, which the
+  system does not provide.
 - **Linux** — the code paths exist (`sh`, `xdg-open`, robotgo), but builds are
   not currently produced or tested.
 
