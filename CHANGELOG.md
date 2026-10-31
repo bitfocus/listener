@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/bitfocus/listener/compare/v1.1.0...v1.2.0) (2026-10-31)
+
+
+### Features
+
+* add windows arm64 build ([#25](https://github.com/bitfocus/listener/issues/25)) ([9638fdb](https://github.com/bitfocus/listener/commit/9638fdbf169c45b9a520cd27126b7828c4010e70))
+
 ## [1.1.0](https://github.com/bitfocus/listener/compare/v1.0.13...v1.1.0) (2026-10-27)
 
 
