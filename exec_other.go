@@ -2,6 +2,11 @@
 
 package main
 
-import "os/exec"
+import (
+	"context"
+	"os/exec"
+)
 
-func hideCmdWindow(cmd *exec.Cmd) {}
+func shellCommand(ctx context.Context, shell string) *exec.Cmd {
+	return exec.CommandContext(ctx, "sh", "-c", shell)
+}

@@ -29,7 +29,7 @@ go run .
 go get ./...
 ```
 
-There are no tests in this project.
+Tests are minimal (`go test ./...`); CI only runs gofmt and `go vet`.
 
 ## Architecture
 
@@ -64,6 +64,7 @@ There are no tests in this project.
 - All commands require authentication first; each command type can be individually enabled/disabled via `AllowedCommands`
 - Key access has two modes: `full_access` (all keys) or `restricted` (only whitelisted categories/keys)
 - `fileWrite` (in `filewrite.go`) writes only inside GUI-configured `FileWriteRoots`, which clients reference by name. It uses `os.Root` and an extension allowlist, and it is off by default even on new installs (`offByDefault`)
+- `shellRun` on Windows sets a raw `SysProcAttr.CmdLine` of `cmd.exe /S /C "<shell>"` (see `exec_windows.go`), so quotes, redirects and `&` reach cmd unaltered; Unix uses `sh -c`
 - Password rotate disconnects all active clients
 
 ## Platform-Specific Behavior

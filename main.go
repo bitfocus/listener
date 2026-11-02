@@ -510,6 +510,13 @@ func sanitizeOpenTarget(target string) (string, error) {
 	return target, nil
 }
 
+// windowsShellCmdLine builds the raw cmd.exe command line for shellRun. /S makes
+// cmd strip only the first and last quote, so everything between the wrapper
+// quotes, including any quotes inside shell, runs exactly as the client sent it.
+func windowsShellCmdLine(shell string) string {
+	return `cmd.exe /S /C "` + shell + `"`
+}
+
 // -------------------------
 // System Information (gopsutil)
 // -------------------------
@@ -1419,15 +1426,8 @@ func handleCommand(client *Client, cmd Command) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), shellTimeout)
 			defer cancel()
-			var command *exec.Cmd
-			if runtime.GOOS == "windows" {
-				// nosec
-				command = exec.CommandContext(ctx, "cmd", "/C", shell)
-			} else {
-				// nosec
-				command = exec.CommandContext(ctx, "sh", "-c", shell)
-			}
-			hideCmdWindow(command)
+			// nosec
+			command := shellCommand(ctx, shell)
 			out, err := command.CombinedOutput()
 			if err != nil {
 				log.Printf("Shell command error: %v", err)
@@ -1463,7 +1463,7 @@ func handleCommand(client *Client, cmd Command) {
 			// nosec
 			command = exec.Command("xdg-open", target)
 		}
-		// No hideCmdWindow here: rundll32 has no console, and SW_HIDE would be
+		// Don't set HideWindow here: rundll32 has no console, and SW_HIDE would be
 		// forwarded to ShellExecute, so Explorer opens folders without focus.
 		if err := command.Start(); err != nil {
 			log.Printf("File open error: %v", err)
