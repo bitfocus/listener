@@ -1463,7 +1463,8 @@ func handleCommand(client *Client, cmd Command) {
 			// nosec
 			command = exec.Command("xdg-open", target)
 		}
-		hideCmdWindow(command)
+		// No hideCmdWindow here: rundll32 has no console, and SW_HIDE would be
+		// forwarded to ShellExecute, so Explorer opens folders without focus.
 		if err := command.Start(); err != nil {
 			log.Printf("File open error: %v", err)
 			auditLog(client.IP, "COMMAND_FAILED", fmt.Sprintf("fileOpen %s: %v", target, err))
