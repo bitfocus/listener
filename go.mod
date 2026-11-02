@@ -7,6 +7,7 @@ require (
 	github.com/go-vgo/robotgo v1.3.7
 	github.com/gorilla/websocket v1.5.3
 	github.com/shirou/gopsutil/v4 v4.26.9
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -60,6 +61,5 @@ require (
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
 	golang.org/x/image v0.47.0 // indirect
 	golang.org/x/net v0.61.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 )
