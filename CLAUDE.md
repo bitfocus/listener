@@ -42,6 +42,7 @@ There are no tests in this project.
 5. **HTTP Server**: Start/stop/restart on interface:port with `/ws` endpoint (mutex-guarded)
 6. **Network Interfaces**: Discovery for GUI binding dropdown
 7. **GUI / tray**: Fyne settings window; system tray / menu bar with hide-on-close
+8. **Launch at login** (`loginitem_*.go`): per-user only, never elevated. Windows uses the HKCU `Run` key (respecting `StartupApproved`), macOS uses `SMAppService.mainApp`. The OS is the source of truth; only `StartHidden` is stored in config
 
 **Key dependencies:**
 - `fyne.io/fyne/v2` — cross-platform GUI + system tray

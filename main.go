@@ -76,6 +76,9 @@ type Config struct {
 	// FileWriteRoots maps the folder names clients use in fileWrite to real
 	// folders. Only the local GUI can change it.
 	FileWriteRoots map[string]string `json:"file_write_roots,omitempty"`
+	// StartHidden keeps the settings window closed at launch (tray only).
+	// Launch at login itself is read from the OS, not stored here.
+	StartHidden bool `json:"start_hidden,omitempty"`
 }
 
 var config Config
@@ -2758,11 +2761,16 @@ func showActivityLogDialog(parent fyne.Window) {
 }
 
 func startGUI() {
-	buildMainWindow(app.New()).ShowAndRun()
+	myApp := app.New()
+	if w, startHidden := buildMainWindow(myApp); !startHidden {
+		w.Show()
+	}
+	myApp.Run()
 	auditLog("system", "STOPPED", "")
 }
 
-func buildMainWindow(myApp fyne.App) fyne.Window {
+// buildMainWindow also reports whether the window should stay hidden at launch.
+func buildMainWindow(myApp fyne.App) (fyne.Window, bool) {
 	myApp.Settings().SetTheme(newListenerTheme())
 	guiStarted.Store(true)
 	appIcon := fyne.NewStaticResource("icon.png", iconPNG)
@@ -2813,6 +2821,29 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		}
 	}
 
+	configMu.RLock()
+	startHidden := trayEnabled && config.StartHidden
+	configMu.RUnlock()
+
+	// A window started hidden has no NSWindow until its first Show, so the
+	// title bar chrome is applied then rather than at launch.
+	var openSize fyne.Size
+	chromeApplied := false
+	applyChrome := func() {
+		if chromeApplied {
+			return
+		}
+		chromeApplied = true
+		applyWindowChrome(w)
+		// The content view now spans the old title bar, so re-apply the size.
+		w.Resize(openSize)
+	}
+	showSettings := func() {
+		w.Show()
+		applyChrome()
+		w.RequestFocus()
+	}
+
 	buildTrayMenu := func(status string) {
 		if deskApp == nil {
 			return
@@ -2829,13 +2860,9 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 			titleItem,
 			statusItem,
 			fyne.NewMenuItemSeparator(),
-			fyne.NewMenuItem("Open Settings…", func() {
-				w.Show()
-				w.RequestFocus()
-			}),
+			fyne.NewMenuItem("Open Settings…", showSettings),
 			fyne.NewMenuItem("Activity Log…", func() {
-				w.Show()
-				w.RequestFocus()
+				showSettings()
 				showActivityLogDialog(w)
 			}),
 			fyne.NewMenuItemSeparator(),
@@ -2860,12 +2887,11 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		}
 		myApp.Quit()
 	})
-	var openSize fyne.Size
 	myApp.Lifecycle().SetOnStarted(func() {
 		hideDockIcon()
-		applyWindowChrome(w)
-		// The content view now spans the old title bar, so re-apply the size.
-		w.Resize(openSize)
+		if !startHidden {
+			applyChrome()
+		}
 	})
 
 	targetHostLabel := widget.NewLabel(websocketTargetHost())
@@ -3114,6 +3140,64 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		}),
 	)
 
+	// Fyne keeps a single foreground handler, so refreshers are collected here.
+	// Both permissions and login items are changed in the OS's own settings.
+	var onForeground []func()
+
+	var startupRows []fyne.CanvasObject
+	if loginItemSupported() {
+		loginHint := newSubtleText(loginItemBlockedHint)
+		openLoginSettings := widget.NewButton("Open Settings", openLoginItemSettings)
+		openLoginSettings.Importance = widget.LowImportance
+		loginBlockedRow := container.NewBorder(nil, nil, nil, openLoginSettings, loginHint)
+		var loginCheck *widget.Check
+		refreshLoginItem := func() {
+			status := getLoginItemStatus()
+			setChecked(loginCheck, status == loginItemOn)
+			if status == loginItemBlocked {
+				loginBlockedRow.Show()
+			} else {
+				loginBlockedRow.Hide()
+			}
+		}
+		loginCheck = widget.NewCheck("Launch at login", func(on bool) {
+			if err := setLoginItem(on); err != nil {
+				dialog.ShowError(err, w)
+			} else {
+				auditLog("gui", "LOGIN_ITEM_CHANGED", fmt.Sprintf("enabled=%t", on))
+				if on && getLoginItemStatus() == loginItemBlocked {
+					openLoginItemSettings()
+				}
+			}
+			refreshLoginItem()
+		})
+		refreshLoginItem()
+		onForeground = append(onForeground, refreshLoginItem)
+		startupRows = append(startupRows, loginCheck, loginBlockedRow)
+	}
+	if trayEnabled {
+		hiddenLabel := "Start hidden in the system tray"
+		if runtime.GOOS == "darwin" {
+			hiddenLabel = "Start hidden in the menu bar"
+		}
+		hiddenCheck := widget.NewCheck(hiddenLabel, func(on bool) {
+			configMu.Lock()
+			config.StartHidden = on
+			err := saveConfigLocked(&config)
+			configMu.Unlock()
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			auditLog("gui", "START_HIDDEN_CHANGED", fmt.Sprintf("enabled=%t", on))
+		})
+		setChecked(hiddenCheck, startHidden)
+		if len(startupRows) > 0 {
+			startupRows = append(startupRows, widget.NewSeparator())
+		}
+		startupRows = append(startupRows, hiddenCheck)
+	}
+
 	generalRows := []fyne.CanvasObject{
 		newTapRow("Activity log", nil, nil, func() { showActivityLogDialog(w) }),
 		widget.NewSeparator(),
@@ -3129,14 +3213,18 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 			}
 		}
 		refreshAccessStatus()
-		// Permission is granted in System Settings, so re-check when the user comes back.
-		myApp.Lifecycle().SetOnEnteredForeground(refreshAccessStatus)
+		onForeground = append(onForeground, refreshAccessStatus)
 		generalRows = append(generalRows,
 			widget.NewSeparator(),
 			newTapRow("Accessibility permission", accessStatus, nil, openAccessibilitySettings),
 		)
 	}
 	generalSection := newSection("General", generalRows...)
+	myApp.Lifecycle().SetOnEnteredForeground(func() {
+		for _, refresh := range onForeground {
+			refresh()
+		}
+	})
 
 	copyrightYear := time.Now().Year()
 	if BUILDTIME > 0 {
@@ -3160,7 +3248,11 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 		&widget.TextSegment{Text: "\n" + trayHint, Style: hintStyle},
 	)
 
-	page := container.NewVBox(bindErrorBanner, statusSection, connectionSection, securitySection, generalSection)
+	page := container.NewVBox(bindErrorBanner, statusSection, connectionSection, securitySection)
+	if len(startupRows) > 0 {
+		page.Add(newSection("Startup", startupRows...))
+	}
+	page.Add(generalSection)
 	margin := 2 * theme.Padding()
 
 	// The divider only appears once content scrolls under the header, like
@@ -3211,7 +3303,7 @@ func buildMainWindow(myApp fyne.App) fyne.Window {
 	w.Resize(openSize)
 	w.SetFixedSize(false)
 	guiReady = true
-	return w
+	return w, startHidden
 }
 
 func main() {
@@ -3223,6 +3315,7 @@ func main() {
 		log.Fatal("Error initializing audit logger:", err)
 	}
 	auditLog("system", "STARTED", fmt.Sprintf("version=%s port=%s", HumanVersion, config.Port))
+	syncLoginItem()
 	// Start the server initially.
 	startHTTPServer(config.Interface, config.Port, func(err error) {
 		if err != nil {
