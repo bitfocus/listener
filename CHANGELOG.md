@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0](https://github.com/bitfocus/listener/compare/v1.1.0...v1.2.0) (2026-11-02)
+
+
+### Features
+
+* add launch at login and start hidden ([#30](https://github.com/bitfocus/listener/issues/30)) ([e6cf118](https://github.com/bitfocus/listener/commit/e6cf1181ecd3317fb99ff3ff468d100fd0e66990)), closes [#12](https://github.com/bitfocus/listener/issues/12)
+* add windows arm64 build ([#25](https://github.com/bitfocus/listener/issues/25)) ([9638fdb](https://github.com/bitfocus/listener/commit/9638fdbf169c45b9a520cd27126b7828c4010e70))
+
+
+### Bug Fixes
+
+* make sure files/folders are opened with focus on Windows ([#28](https://github.com/bitfocus/listener/issues/28)) ([37bc0a8](https://github.com/bitfocus/listener/commit/37bc0a8f93fda50e543b37aba64a975f0e82695c))
+* pass shellRun commands to cmd.exe unaltered on Windows ([#29](https://github.com/bitfocus/listener/issues/29)) ([4272aea](https://github.com/bitfocus/listener/commit/4272aea8f39db8e58ef5c1a5c4ad24254921ab4f))
+
 ## [1.1.0](https://github.com/bitfocus/listener/compare/v1.0.13...v1.1.0) (2026-10-27)
 
 
